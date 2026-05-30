@@ -1,0 +1,51 @@
+# templates/generic-syslog/manifest.yml
+#
+# Catch-all template for unstructured RFC3164 / RFC5424 syslog. Useful as a
+# safety net for sources you haven't built a vendor-specific template for
+# yet — events still land in ES with timestamp + hostname + program parsed.
+
+name: generic-syslog
+version: 0.1.0
+description: |
+  Generic RFC3164/RFC5424 syslog ingest. Parses timestamp, host, program,
+  and message body; no vendor-specific field extraction.
+maintainers:
+  - TBD
+
+# Default ports if not overridden in the inventory.
+defaults:
+  udp_port: 5140
+  tcp_port: 5140
+
+# Bundle layout — relative to this manifest. Sections may be omitted.
+contents:
+  rsyslog:       ["rsyslog/10-generic-syslog.conf"]            # TBD
+  logstash:      ["logstash/30-generic-syslog.conf"]           # TBD
+  elasticsearch:
+    component_templates: ["elasticsearch/component-template.json"]   # TBD
+    index_templates:     ["elasticsearch/index-template.json"]       # TBD
+    ilm_policies:        ["elasticsearch/ilm-policy.json"]           # TBD
+  kibana:
+    data_views:  ["kibana/data-view.ndjson"]                   # TBD
+    dashboards:  ["kibana/dashboards.ndjson"]                  # TBD
+
+# Fields this template populates. Used by elk-template lint to flag mapping
+# conflicts with other enabled templates.
+fields:
+  - name: "@timestamp"
+    type: date
+  - name: host.name
+    type: keyword
+  - name: log.syslog.facility.code
+    type: byte
+  - name: log.syslog.severity.code
+    type: byte
+  - name: process.name
+    type: keyword
+  - name: message
+    type: text
+
+changelog:
+  - version: 0.1.0
+    date: TBD
+    notes: Initial scaffolding.

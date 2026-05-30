@@ -1,0 +1,16 @@
+# profiles/small-prod.yml — three-host prod-ish layout.
+#
+# Status: stub. Fill in once the lab profile is fully exercised end-to-end.
+# Intended shape:
+#   - elk-es-01:     es-master + es-data
+#   - elk-ls-01:     logstash + rsyslog front door
+#   - elk-kbn-01:    kibana + nginx + LE
+#
+# Use lab.yml as the schema reference; this file will mirror it with
+# three hosts and split roles.
+
+profile: small-prod
+description: Three-host ELK split into ES / LS / Kibana (TBD).
+
+stack_version: TBD
+hosts: []

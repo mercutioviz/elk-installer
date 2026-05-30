@@ -1,0 +1,41 @@
+# templates/barracuda-waf/manifest.yml
+#
+# Status: scaffolding only. The actual pipeline, mappings, and dashboards
+# get authored against a real sample stream captured via
+# `elk-listen capture --vendor barracuda-waf`.
+#
+# Do not flip `enabled: true` for this template in any inventory until the
+# manifest, pipeline, and dashboards exist and `elk-template lint` passes.
+
+name: barracuda-waf
+version: 0.1.0
+description: |
+  Ingest for Barracuda Web Application Firewall syslog. (Scaffold — not
+  ready for use.)
+maintainers:
+  - TBD
+
+defaults:
+  udp_port: 5141
+  tcp_port: 5141
+
+contents:
+  rsyslog:       []
+  logstash:      []
+  elasticsearch:
+    component_templates: []
+    index_templates:     []
+    ilm_policies:        []
+  kibana:
+    data_views: []
+    dashboards: []
+
+fields: []
+
+changelog:
+  - version: 0.1.0
+    date: 2026-05-30
+    notes: Re-exported via 'elk-template export'.
+  - version: 0.0.1
+    date: TBD
+    notes: Scaffold only; no usable content yet.

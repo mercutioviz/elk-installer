@@ -1,0 +1,2 @@
+{"attributes":{"name":"Syslog (Generic)","title":"logs-syslog.generic-default","timeFieldName":"@timestamp","allowNoIndex":true},"coreMigrationVersion":"9.0.0","id":"elk-installer-syslog-generic","managed":false,"references":[],"type":"index-pattern","typeMigrationVersion":"8.0.0"}
+{"excludedObjects":[],"excludedObjectsCount":0,"exportedCount":1,"missingRefCount":0,"missingReferences":[]}

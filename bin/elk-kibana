@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# elk-kibana — bootstrap Kibana spaces, roles, and baseline saved objects.
+# Also used by elk-template export to round-trip dashboards via the
+# saved-objects API.
+#
+# Status: scaffolding. Subcommands are stubs.
+
+set -euo pipefail
+
+_here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "${_here}/../lib/common.sh"
+# shellcheck source=../lib/inventory.sh
+source "${_here}/../lib/inventory.sh"
+# shellcheck source=../lib/kbn_api.sh
+source "${_here}/../lib/kbn_api.sh"
+
+INVENTORY_PATH="${ELK_INVENTORY_FILE:-${_here}/../inventory.yml}"
+
+usage() {
+  cat <<'EOF'
+elk-kibana — Kibana bootstrap + saved-object round-tripping.
+
+USAGE:
+  elk-kibana <subcommand> [options]
+
+SUBCOMMANDS:
+  bootstrap         Create baseline spaces, roles, and the "home" dashboard
+  export-view       Export saved objects matching an index pattern as ndjson
+  import-view       Import an ndjson bundle into a target space
+  whoami            Print the user the configured API key resolves to (sanity)
+
+Each subcommand has its own --help.
+EOF
+}
+
+cmd_bootstrap() {
+  _phase kibana-bootstrap
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -i|--inventory) INVENTORY_PATH="$2"; shift 2 ;;
+      -h|--help)
+        cat <<'EOF'
+elk-kibana bootstrap — create baseline saved objects via the Kibana API.
+
+Currently creates the "Syslog (Generic)" data view for the
+logs-syslog.generic-default data stream. Idempotent.
+EOF
+        return 0
+        ;;
+      *) die "bootstrap: unknown arg '$1'" ;;
+    esac
+  done
+
+  inventory::load "$INVENTORY_PATH"
+
+  # Find a host with the kibana role and use the first one.
+  local host kbn_host=""
+  while read -r host; do
+    if inventory::roles_for "$host" | grep -qx kibana; then
+      kbn_host="$host"; break
+    fi
+  done < <(inventory::hosts)
+  [[ -n "$kbn_host" ]] || die "bootstrap: no host has the 'kibana' role"
+
+  log_info "bootstrap: target host = ${kbn_host}"
+  kbn::ping "$kbn_host" || die "bootstrap: Kibana not reachable at $(kbn::base_url "$kbn_host")"
+
+  kbn::create_data_view "$kbn_host" \
+    "syslog-generic" "logs-syslog.generic-default" "@timestamp" \
+    "Syslog (Generic)"
+
+  log_info "bootstrap: done"
+}
+
+cmd_export_view() { _phase kibana-export;     not_implemented "elk-kibana export-view"; }
+cmd_import_view() { _phase kibana-import;     not_implemented "elk-kibana import-view"; }
+
+cmd_whoami() {
+  _phase kibana-whoami
+  inventory::load "$INVENTORY_PATH"
+  local host kbn_host=""
+  while read -r host; do
+    if inventory::roles_for "$host" | grep -qx kibana; then kbn_host="$host"; break; fi
+  done < <(inventory::hosts)
+  [[ -n "$kbn_host" ]] || die "whoami: no host has the 'kibana' role"
+
+  # Auth sanity check. We hit /api/data_views — auth-required and stable
+  # across Kibana 8/9. (The older /internal/security/me path returns 400
+  # in 9.x depending on security config; not reliable.)
+  local body http
+  body=$(mktemp)
+  http=$(kbn::curl "$kbn_host" -o "$body" -w '%{http_code}' \
+    "$(kbn::base_url "$kbn_host")/api/data_views")
+  case "$http" in
+    200)
+      local count
+      count=$(jq -r '.data_view | length' "$body" 2>/dev/null || echo "?")
+      log_info "auth ok at $(kbn::base_url "$kbn_host") as 'elastic'"
+      log_info "data views visible: ${count}"
+      rm -f "$body"
+      ;;
+    401|403)
+      log_error "auth FAILED (HTTP ${http}) — check secrets/${kbn_host}.elastic.password"
+      rm -f "$body"
+      return 1
+      ;;
+    *)
+      log_error "unexpected response (HTTP ${http}):"
+      cat "$body" >&2
+      rm -f "$body"
+      return 1
+      ;;
+  esac
+}
+
+main() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -i|--inventory) INVENTORY_PATH="$2"; shift 2 ;;
+      --debug) ELK_DEBUG=1; export ELK_DEBUG; shift ;;
+      -h|--help|help) usage; exit 0 ;;
+      --) shift; break ;;
+      -*) die "unknown global option: $1" ;;
+      *) break ;;
+    esac
+  done
+  if [[ $# -eq 0 ]]; then usage; exit 0; fi
+
+  local sub="$1"; shift
+  case "$sub" in
+    bootstrap)   cmd_bootstrap   "$@" ;;
+    export-view) cmd_export_view "$@" ;;
+    import-view) cmd_import_view "$@" ;;
+    whoami)      cmd_whoami      "$@" ;;
+    *) die "unknown subcommand: ${sub} (try 'elk-kibana --help')" ;;
+  esac
+}
+
+main "$@"

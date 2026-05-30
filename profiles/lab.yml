@@ -1,0 +1,88 @@
+# profiles/lab.yml — single-host all-in-one ELK for lab / demo.
+#
+# This profile is also the **schema example**: copy it to ./inventory.yml,
+# fill in your host(s), and run `elk-install apply -p lab`.
+#
+# Anything marked TBD must be set before the corresponding phase runs.
+# The installer's preflight will refuse to proceed if a TBD remains.
+
+profile: lab
+description: Single-host all-in-one ELK for lab / demo work.
+
+# -----------------------------------------------------------------------------
+# Stack version. Pin a SPECIFIC patch version (e.g. "8.15.3"), not a floating
+# major. The installer reads this and pins apt to the matching package.
+# Leave blank to fail-loudly at preflight — we never auto-pick a version.
+# -----------------------------------------------------------------------------
+stack_version: TBD
+
+# -----------------------------------------------------------------------------
+# Hosts. For lab, exactly one host with all roles.
+# -----------------------------------------------------------------------------
+hosts:
+  - name: elk-lab-01
+    address: TBD              # IP or DNS name reachable from the control node
+    ssh_user: TBD             # e.g. admin / ubuntu / debian
+    ssh_key: ~/.ssh/id_ed25519
+    roles:
+      - es-master
+      - es-data
+      - logstash
+      - kibana
+
+# -----------------------------------------------------------------------------
+# TLS. In lab we generate a self-signed CA under secrets/ and use it for
+# transport + HTTP + the LS -> ES leg. Public Kibana TLS:
+#   - if `kibana.public_fqdn` is set AND `kibana.letsencrypt_email` is set,
+#     we run certbot --nginx; otherwise we self-sign and warn.
+# -----------------------------------------------------------------------------
+tls:
+  ca_subject: "CN=elk-lab CA"
+  cert_validity_days: 825   # browsers cap at 825; we match
+
+kibana:
+  public_fqdn: ""           # e.g. kibana.lab.example.com — leave empty for self-signed
+  letsencrypt_email: ""
+  allowed_cidrs:
+    - 0.0.0.0/0             # tighten this for anything real
+
+# -----------------------------------------------------------------------------
+# Firewall (nftables). The installer manages a table named `elk` only;
+# everything else on the host is untouched.
+# -----------------------------------------------------------------------------
+firewall:
+  manage: true
+  intra_cluster_cidrs:
+    - 127.0.0.1/32          # lab is single-host
+
+# -----------------------------------------------------------------------------
+# Vendor templates to enable. Each entry references a directory under
+# templates/<name>/ and assigns the syslog ports rsyslog will listen on.
+# Ports must be unique across enabled vendors.
+# -----------------------------------------------------------------------------
+templates:
+  - name: generic-syslog
+    enabled: true
+    udp_port: 5140
+    tcp_port: 5140
+
+  # Examples — disabled by default in lab. Flip `enabled: true` to wire up.
+  - name: barracuda-waf
+    enabled: false
+    udp_port: 5141
+    tcp_port: 5141
+
+# -----------------------------------------------------------------------------
+# Sysctl / OS knobs the installer is allowed to set. Leave the defaults;
+# preflight will warn if any are missing on the target.
+# -----------------------------------------------------------------------------
+os_tuning:
+  set_vm_max_map_count: true   # ES requires 262144
+  disable_swap: true           # ES strongly prefers swap off
+
+# -----------------------------------------------------------------------------
+# Optional self-monitoring. v1 default: off. Flip on once the stack is up.
+# -----------------------------------------------------------------------------
+self_monitoring:
+  metricbeat: false
+  filebeat:   false

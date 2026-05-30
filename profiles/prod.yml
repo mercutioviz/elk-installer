@@ -1,0 +1,15 @@
+# profiles/prod.yml — multi-node ES cluster with HA Logstash + Kibana.
+#
+# Status: stub. Drafted once small-prod is solid. Intended shape:
+#   - 3x es-master + es-data (or split tiers if scale warrants)
+#   - 2x logstash + rsyslog
+#   - 2x kibana behind a cloud LB
+#   - optional dedicated coord nodes
+#
+# Use lab.yml as the schema reference.
+
+profile: prod
+description: Multi-node HA ELK cluster (TBD).
+
+stack_version: TBD
+hosts: []

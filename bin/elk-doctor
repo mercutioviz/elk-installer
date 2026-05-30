@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# elk-doctor — end-to-end health checks for an installed stack.
+#
+# Status: scaffolding. Subcommands are stubs.
+
+set -euo pipefail
+
+_here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "${_here}/../lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+elk-doctor — health checks for an installed ELK stack.
+
+USAGE:
+  elk-doctor [check ...]
+
+CHECKS (run all by default):
+  cluster      Elasticsearch cluster health (green/yellow/red)
+  pipelines    Logstash pipeline status + lag
+  certs        TLS cert expiry across nodes (transport + HTTP + Kibana)
+  disk         Disk usage vs ES watermarks
+  ingest       Sample ingest end-to-end (rsyslog -> LS -> ES -> search)
+  templates    Verify applied templates match repo state
+  secrets      Age of secrets vs rotation policy
+
+EXAMPLES:
+  elk-doctor                       # run everything
+  elk-doctor cluster certs         # run only the named checks
+  elk-doctor --inventory infra.yml ingest
+EOF
+}
+
+cmd_check() {
+  _phase doctor
+  not_implemented "elk-doctor checks"
+}
+
+main() {
+  if [[ $# -eq 0 ]]; then
+    cmd_check
+    return
+  fi
+
+  case "$1" in
+    -h|--help|help) usage; exit 0 ;;
+    *) cmd_check "$@" ;;
+  esac
+}
+
+main "$@"

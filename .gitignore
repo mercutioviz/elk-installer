@@ -1,3 +1,33 @@
+# =============================================================================
+# elk-installer overrides — keep these checked in despite the Python defaults
+# below. The Python template was used to bootstrap this repo; most of our code
+# is bash + small Python helpers.
+# =============================================================================
+!/lib/
+!/lib/*
+
+# Project-local artifacts to ignore
+/secrets/*
+!/secrets/.gitkeep
+!/secrets/README.md
+/tests/multipass/.cache/
+/tests/compose/.cache/
+
+# elk-listen dev-loop outputs (per-run, not source)
+/samples/
+/pipelines/
+
+# Playwright venv (~160 MB) and ad-hoc screenshots
+/tests/verify/.venv/
+/tests/verify/screenshots/
+
+*.log.gz
+*.bak
+
+# =============================================================================
+# Python defaults (from cookiecutter template) follow
+# =============================================================================
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -216,3 +246,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# =============================================================================
+# elk-installer FINAL overrides (must come after the Python defaults to win)
+# =============================================================================
+!/lib/
+!/lib/*

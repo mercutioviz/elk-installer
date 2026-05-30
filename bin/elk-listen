@@ -1,0 +1,256 @@
+#!/usr/bin/env bash
+# elk-listen — capture syslog samples and assist with Logstash pipeline
+# authoring. The capture/analyze/test/promote loop is the bridge between
+# "a device is pointed at port N" and "a working filter is in conf.d/".
+#
+# Status: scaffolding. Subcommands are stubs.
+
+set -euo pipefail
+
+_here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "${_here}/../lib/common.sh"
+# shellcheck source=../lib/inventory.sh
+source "${_here}/../lib/inventory.sh"
+# shellcheck source=../lib/ssh.sh
+source "${_here}/../lib/ssh.sh"
+# shellcheck source=../lib/listen.sh
+source "${_here}/../lib/listen.sh"
+
+INVENTORY_PATH="${ELK_INVENTORY_FILE:-${_here}/../inventory.yml}"
+ANALYZE_PY="${_here}/../lib/listen_analyze.py"
+
+trap 'ssh::shutdown_all 2>/dev/null || true' EXIT
+
+usage() {
+  cat <<'EOF'
+elk-listen — capture syslog and help author Logstash pipelines.
+
+USAGE:
+  elk-listen <subcommand> [options]
+
+SUBCOMMANDS:
+  capture    Open a temporary UDP+TCP listener and record raw events
+  analyze    Inspect a sample file and suggest grok patterns
+  test       Run a candidate pipeline against a sample with logstash -t
+  promote    Install a tested pipeline into /etc/logstash/conf.d/ and reload
+
+EXAMPLES:
+  elk-listen capture --port 5141 --vendor barracuda-waf --seconds 120
+  elk-listen analyze ./samples/barracuda-waf.log
+  elk-listen test ./pipelines/barracuda-waf.conf ./samples/barracuda-waf.log
+  elk-listen promote --vendor barracuda-waf
+
+Run `elk-listen <subcommand> --help` for subcommand-specific options.
+EOF
+}
+
+cmd_capture() {
+  _phase capture
+  local vendor="" port="" seconds=60
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --vendor)   vendor="$2"; shift 2 ;;
+      --port)     port="$2"; shift 2 ;;
+      --seconds)  seconds="$2"; shift 2 ;;
+      -i|--inventory) INVENTORY_PATH="$2"; shift 2 ;;
+      -h|--help)
+        cat <<'EOF'
+elk-listen capture --vendor NAME --port PORT [--seconds N]
+
+Drops a temporary rsyslog drop-in on the LS host that listens on PORT
+(UDP+TCP) and writes raw events to a local file. After --seconds (default
+60), removes the drop-in and copies the sample back to ./samples/.
+EOF
+        return 0
+        ;;
+      *) die "capture: unknown arg '$1'" ;;
+    esac
+  done
+  [[ -n "$vendor" ]] || die "capture: --vendor required"
+  [[ -n "$port" ]]   || die "capture: --port required"
+  [[ "$port" =~ ^[0-9]+$ ]] || die "capture: --port must be numeric"
+  [[ "$seconds" =~ ^[0-9]+$ ]] || die "capture: --seconds must be numeric"
+
+  inventory::load "$INVENTORY_PATH"
+  local ls_host; ls_host=$(listen::find_ls_host) \
+    || die "capture: no host has the 'logstash' role"
+  log_info "capture: LS host = ${ls_host}"
+
+  local addr; addr=$(inventory::host_field "$ls_host" address)
+  log_info "capture: point your device at  udp/tcp ${addr}:${port}"
+
+  local out_file
+  out_file=$(listen::capture "$ls_host" "$vendor" "$port" "$seconds")
+  log_info "capture: done. analyze with:"
+  log_info "         ./bin/elk-listen analyze ${out_file} --vendor ${vendor}"
+}
+
+cmd_analyze() {
+  _phase analyze
+  local vendor="" out_conf="" internal_port=5044 sample=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --vendor)        vendor="$2"; shift 2 ;;
+      --out-conf)      out_conf="$2"; shift 2 ;;
+      --internal-port) internal_port="$2"; shift 2 ;;
+      -h|--help)
+        cat <<'EOF'
+elk-listen analyze SAMPLE [--vendor NAME] [--out-conf PATH] [--internal-port N]
+
+Reads SAMPLE, classifies syslog format, surfaces top apps/hosts and
+key=value patterns, and (when --vendor is set) writes a starter Logstash
+pipeline to pipelines/<vendor>.conf (or --out-conf).
+EOF
+        return 0
+        ;;
+      -*) die "analyze: unknown arg '$1'" ;;
+      *)  sample="$1"; shift ;;
+    esac
+  done
+  [[ -n "$sample" ]] || die "analyze: SAMPLE required"
+  [[ -r "$sample" ]] || die "analyze: cannot read sample: $sample"
+
+  local args=( "$sample" --internal-port "$internal_port" --repo-root "$ELK_REPO_ROOT" )
+  [[ -n "$vendor"   ]] && args+=( --vendor   "$vendor" )
+  [[ -n "$out_conf" ]] && args+=( --out-conf "$out_conf" )
+
+  python3 "$ANALYZE_PY" "${args[@]}"
+}
+
+cmd_test() {
+  _phase test
+  local conf="" vendor=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --vendor)       vendor="$2"; shift 2 ;;
+      -i|--inventory) INVENTORY_PATH="$2"; shift 2 ;;
+      -h|--help)
+        cat <<'EOF'
+elk-listen test PIPELINE.conf
+elk-listen test --vendor NAME
+
+Validates a candidate Logstash pipeline by running `logstash -t` on the
+LS host. Two modes:
+
+  PIPELINE.conf  — test an arbitrary file (typically pipelines/<vendor>.conf
+                   produced by `elk-listen analyze`).
+
+  --vendor NAME  — tokenize templates/NAME/logstash/*.conf with the same
+                   substitutions lib/ls.sh applies at install time, then
+                   test the result. Internal port is resolved from the
+                   inventory when the vendor is enabled (otherwise 5044
+                   is used as a placeholder — fine for syntax-only check).
+
+Returns non-zero on syntax error.
+EOF
+        return 0
+        ;;
+      -*) die "test: unknown arg '$1'" ;;
+      *)
+        if [[ -n "$conf" ]]; then
+          die "test: PIPELINE.conf may only be given once"
+        fi
+        conf="$1"; shift
+        ;;
+    esac
+  done
+
+  if [[ -n "$conf" && -n "$vendor" ]]; then
+    die "test: pass either PIPELINE.conf or --vendor NAME, not both"
+  fi
+  if [[ -z "$conf" && -z "$vendor" ]]; then
+    die "test: needs either PIPELINE.conf or --vendor NAME"
+  fi
+
+  inventory::load "$INVENTORY_PATH"
+  local ls_host; ls_host=$(listen::find_ls_host) \
+    || die "test: no host has the 'logstash' role"
+
+  if [[ -n "$vendor" ]]; then
+    local tokenized; tokenized=$(mktemp --suffix=.conf)
+    if ! listen::tokenize_vendor_conf "$vendor" > "$tokenized"; then
+      rm -f "$tokenized"
+      die "test: no templates/${vendor}/logstash/*.conf — did you author one?"
+    fi
+    log_info "test: tokenized templates/${vendor}/logstash/ -> ${tokenized}"
+    if listen::syntax_check "$ls_host" "$tokenized"; then
+      rm -f "$tokenized"
+      return 0
+    fi
+    rm -f "$tokenized"
+    return 1
+  fi
+
+  [[ -r "$conf" ]] || die "test: cannot read conf: $conf"
+  listen::syntax_check "$ls_host" "$conf"
+}
+
+cmd_promote() {
+  _phase promote
+  local conf="" vendor="" external="" internal=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --vendor)        vendor="$2"; shift 2 ;;
+      --external-port) external="$2"; shift 2 ;;
+      --internal-port) internal="$2"; shift 2 ;;
+      -i|--inventory)  INVENTORY_PATH="$2"; shift 2 ;;
+      -h|--help)
+        cat <<'EOF'
+elk-listen promote PIPELINE.conf --vendor NAME --external-port N --internal-port M
+
+Deploys a tested pipeline conf to /etc/logstash/conf.d/<vendor>.conf, adds
+the pipeline to pipelines.yml, and drops a temporary rsyslog forwarder
+from EXTERNAL-PORT to LS's INTERNAL-PORT. Restarts both services.
+
+This is the dev-loop promote — not a permanent install. Once happy:
+  elk-template export --name <vendor> --version X.Y.Z ...
+  elk-install apply
+EOF
+        return 0
+        ;;
+      -*) die "promote: unknown arg '$1'" ;;
+      *)  conf="$1"; shift ;;
+    esac
+  done
+  # Check required flags + format before touching the filesystem, so any
+  # missing-flag error surfaces before "cannot read conf: ...".
+  [[ -n "$conf"     ]] || die "promote: PIPELINE.conf required"
+  [[ -n "$vendor"   ]] || die "promote: --vendor required"
+  [[ -n "$external" ]] || die "promote: --external-port required"
+  [[ -n "$internal" ]] || die "promote: --internal-port required"
+  [[ "$external" =~ ^[0-9]+$ ]] || die "promote: --external-port must be numeric"
+  [[ "$internal" =~ ^[0-9]+$ ]] || die "promote: --internal-port must be numeric"
+  [[ -r "$conf"     ]] || die "promote: cannot read conf: $conf"
+
+  inventory::load "$INVENTORY_PATH"
+  local ls_host; ls_host=$(listen::find_ls_host) \
+    || die "promote: no host has the 'logstash' role"
+  listen::deploy_pipeline "$ls_host" "$vendor" "$conf" "$external" "$internal"
+  log_info "promote: ${vendor} deployed. Send events to ${ls_host}:${external} (udp/tcp)"
+}
+
+main() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -i|--inventory) INVENTORY_PATH="$2"; shift 2 ;;
+      --debug) ELK_DEBUG=1; export ELK_DEBUG; shift ;;
+      -h|--help|help) usage; exit 0 ;;
+      --) shift; break ;;
+      -*) die "unknown global option: $1" ;;
+      *) break ;;
+    esac
+  done
+  if [[ $# -eq 0 ]]; then usage; exit 0; fi
+
+  local sub="$1"; shift
+  case "$sub" in
+    capture) cmd_capture "$@" ;;
+    analyze) cmd_analyze "$@" ;;
+    test)    cmd_test    "$@" ;;
+    promote) cmd_promote "$@" ;;
+    *) die "unknown subcommand: ${sub} (try 'elk-listen --help')" ;;
+  esac
+}
+
+main "$@"

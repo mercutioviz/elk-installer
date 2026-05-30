@@ -1,0 +1,580 @@
+#!/usr/bin/env bash
+# elk-template — manage vendor template bundles.
+#
+# A template bundles rsyslog + logstash + elasticsearch + kibana artifacts
+# under templates/<vendor>/. This tool lists / shows / applies / exports /
+# lints / packages those bundles.
+#
+# Status: scaffolding. Subcommands are stubs.
+
+set -euo pipefail
+
+_here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "${_here}/../lib/common.sh"
+# shellcheck source=../lib/inventory.sh
+source "${_here}/../lib/inventory.sh"
+# shellcheck source=../lib/kbn_api.sh
+source "${_here}/../lib/kbn_api.sh"
+# shellcheck source=../lib/ssh.sh
+source "${_here}/../lib/ssh.sh"
+# shellcheck source=../lib/ls.sh
+source "${_here}/../lib/ls.sh"
+
+INVENTORY_PATH="${ELK_INVENTORY_FILE:-${_here}/../inventory.yml}"
+
+usage() {
+  cat <<'EOF'
+elk-template — manage vendor template bundles.
+
+USAGE:
+  elk-template <subcommand> [options]
+
+SUBCOMMANDS:
+  list                   List available templates under templates/
+  show <name>            Print manifest + contents summary for one template
+  search <query>         Search template names/descriptions
+  apply <name>           Install a template onto the target stack
+  export --vendor <v>    Pull current configs/saved-objects into a new template
+  package <dir>          Tarball + checksum a template for distribution
+  lint <dir>             Validate manifest, JSON, grok patterns, port collisions
+
+Each subcommand has its own --help.
+EOF
+}
+
+# Helpers --------------------------------------------------------------------
+_tpl_dir() { printf '%s/%s' "$ELK_TEMPLATES_DIR" "$1"; }
+_tpl_manifest_field() {
+  local dir="$1" field="$2"
+  yq -r ".${field} // \"\"" "${dir}/manifest.yml" 2>/dev/null
+}
+
+cmd_list() {
+  _phase template-list
+  printf '%-22s  %-10s  %s\n' NAME VERSION DESCRIPTION
+  printf '%-22s  %-10s  %s\n' ---------------------- ---------- -----------
+  local d name ver desc
+  for d in "$ELK_TEMPLATES_DIR"/*/; do
+    [[ -d "$d" && -r "${d}manifest.yml" ]] || continue
+    name=$(_tpl_manifest_field "$d" name)
+    ver=$(_tpl_manifest_field "$d" version)
+    desc=$(_tpl_manifest_field "$d" description | tr '\n' ' ' | sed 's/  */ /g' | cut -c1-50)
+    printf '%-22s  %-10s  %s\n' "${name:-?}" "${ver:-?}" "${desc:-(none)}"
+  done
+}
+
+cmd_show() {
+  _phase template-show
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "show: needs a template name (try 'elk-template list')"
+  local dir; dir=$(_tpl_dir "$name")
+  [[ -d "$dir" && -r "${dir}/manifest.yml" ]] || die "show: no such template: ${name}"
+  cat "${dir}/manifest.yml"
+  echo
+  echo "files:"
+  find "$dir" -type f ! -name manifest.yml | sed 's|^|  |'
+}
+
+cmd_search() { _phase template-search; not_implemented "elk-template search"; }
+
+# elk-template apply <name>
+# v1 scope: only the kibana/ section. Logstash/rsyslog/ES sections are
+# present in manifests but currently handled by lib/ls.sh + lib/rsyslog.sh
+# at apply-time (until the inline-vs-bundled refactor lands).
+cmd_apply() {
+  _phase template-apply
+  local name=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -i|--inventory) INVENTORY_PATH="$2"; shift 2 ;;
+      -h|--help)
+        cat <<'EOF'
+elk-template apply <name> — install a vendor template's Kibana saved objects.
+
+v1 scope: imports templates/<name>/kibana/*.ndjson via the saved_objects
+_import API. Logstash + rsyslog pipelines for enabled vendors are still
+configured inline during `elk-install apply`.
+EOF
+        return 0
+        ;;
+      -*) die "apply: unknown arg '$1'" ;;
+      *)  name="$1"; shift ;;
+    esac
+  done
+  [[ -n "$name" ]] || die "apply: needs a template name"
+
+  local dir; dir=$(_tpl_dir "$name")
+  [[ -d "$dir" && -r "${dir}/manifest.yml" ]] || die "apply: no such template: ${name}"
+
+  inventory::load "$INVENTORY_PATH"
+  local kbn_host="" host
+  while read -r host; do
+    if inventory::roles_for "$host" | grep -qx kibana; then kbn_host="$host"; break; fi
+  done < <(inventory::hosts)
+  [[ -n "$kbn_host" ]] || die "apply: no host has the 'kibana' role"
+
+  kbn::ping "$kbn_host" || die "apply: Kibana not reachable at $(kbn::base_url "$kbn_host")"
+
+  local found_kbn=0 f
+  for f in "${dir}/kibana"/*.ndjson; do
+    [[ -e "$f" ]] || continue
+    found_kbn=1
+    kbn::import_ndjson "$kbn_host" "$f" 1 \
+      || die "apply: import failed for $f"
+  done
+
+  # Logstash section. If templates/<name>/logstash/ has confs AND the vendor
+  # is enabled in the inventory, we call ls::configure_pipelines which
+  # rewrites pipelines.yml + all per-vendor confs to match templates+inventory,
+  # then restart LS. If the vendor is NOT in the inventory, we warn and skip
+  # — there's no port allocation, no pipelines.yml entry, etc.
+  local applied_ls=0
+  if [[ -d "${dir}/logstash" ]] \
+     && find "${dir}/logstash" -maxdepth 1 -name '*.conf' 2>/dev/null | grep -q .; then
+    if inventory::vendors | grep -qx "$name"; then
+      local ls_host="" h
+      while read -r h; do
+        if inventory::roles_for "$h" | grep -qx logstash; then ls_host="$h"; break; fi
+      done < <(inventory::hosts)
+      [[ -n "$ls_host" ]] || die "apply: no host has the 'logstash' role"
+
+      log_info "apply: deploying logstash/ confs (re-syncs ALL enabled vendors)"
+      ls::configure_pipelines "$ls_host"
+      ls::start "$ls_host"
+      applied_ls=1
+    else
+      log_warn "apply: ${name} has logstash/ confs but the vendor is NOT enabled in inventory.yml"
+      log_warn "       enable it (set 'enabled: true' under templates:) then re-run."
+    fi
+  fi
+
+  if (( found_kbn == 0 && applied_ls == 0 )); then
+    log_warn "apply: nothing to do for ${name} (no kibana/*.ndjson, no logstash/*.conf, or vendor disabled)"
+  fi
+
+  log_info "apply: template ${name} done"
+}
+
+cmd_export() {
+  _phase template-export
+  local name="" version="" description="" force=0
+  local -a objects=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name)         name="$2"; shift 2 ;;
+      --version)      version="$2"; shift 2 ;;
+      --description)  description="$2"; shift 2 ;;
+      --object)       objects+=("$2"); shift 2 ;;
+      --force)        force=1; shift ;;
+      -i|--inventory) INVENTORY_PATH="$2"; shift 2 ;;
+      -h|--help)
+        cat <<'EOF'
+elk-template export — pull Kibana saved objects into a template bundle.
+
+USAGE:
+  elk-template export --name NAME --version VER --object type:id [--object ...] [--force]
+
+OPTIONS:
+  --name NAME            Template directory under templates/
+  --version VER          SemVer string; pinned in manifest.yml + CHANGELOG
+  --description TEXT     Free text for manifest.yml (optional)
+  --object TYPE:ID       Repeatable. e.g. dashboard:abc123, index-pattern:my-view
+  --force                Overwrite an existing manifest's same-version block
+
+WHAT THIS DOES:
+  POST /api/saved_objects/_export with includeReferencesDeep=true so every
+  visualization, lens, and data view the target objects depend on comes
+  along. Output is sorted by object id (deterministic git diffs).
+  Per-object output files: kibana/<TYPE>-<ID>.ndjson.
+EOF
+        return 0
+        ;;
+      *) die "export: unknown arg '$1'" ;;
+    esac
+  done
+
+  [[ -n "$name" ]]    || die "export: --name required"
+  [[ -n "$version" ]] || die "export: --version required"
+  (( ${#objects[@]} > 0 )) || die "export: at least one --object type:id required"
+
+  # Validate --object format up front (so we fail before touching the API).
+  local obj
+  for obj in "${objects[@]}"; do
+    if [[ "$obj" != *:* || "${obj%%:*}" == "" || "${obj#*:}" == "" ]]; then
+      die "export: bad --object '${obj}', expected TYPE:ID"
+    fi
+  done
+
+  inventory::load "$INVENTORY_PATH"
+  local kbn_host="" host
+  while read -r host; do
+    if inventory::roles_for "$host" | grep -qx kibana; then kbn_host="$host"; break; fi
+  done < <(inventory::hosts)
+  [[ -n "$kbn_host" ]] || die "export: no host has the 'kibana' role"
+
+  kbn::ping "$kbn_host" \
+    || die "export: Kibana not reachable at $(kbn::base_url "$kbn_host")"
+
+  local dir; dir=$(_tpl_dir "$name")
+  local manifest="${dir}/manifest.yml"
+  if [[ -e "$manifest" && $force -eq 0 ]]; then
+    local existing_version
+    existing_version=$(_tpl_manifest_field "$dir" version)
+    if [[ "$existing_version" == "$version" ]]; then
+      die "export: ${name}@${version} already exists in ${manifest}; pass --force to overwrite"
+    fi
+  fi
+
+  install -d -m 0755 "${dir}/kibana"
+
+  # Build the request body via jq from the list of TYPE:ID pairs.
+  local req_body
+  req_body=$(
+    printf '%s\n' "${objects[@]}" \
+      | jq -R 'split(":") | {type:.[0], id:.[1]}' \
+      | jq -s '{objects: ., includeReferencesDeep: true, excludeExportDetails: false}'
+  )
+  log_info "export: requesting ${#objects[@]} object(s) + deep references"
+
+  local raw http
+  raw=$(mktemp)
+  http=$(kbn::curl "$kbn_host" \
+    -X POST "$(kbn::base_url "$kbn_host")/api/saved_objects/_export" \
+    -H 'Content-Type: application/json' \
+    -d "$req_body" \
+    -o "$raw" -w '%{http_code}')
+
+  if [[ "$http" != "200" ]]; then
+    log_error "export: HTTP ${http} from saved_objects/_export"
+    cat "$raw" >&2
+    rm -f "$raw"
+    return 1
+  fi
+
+  # The export response is ndjson: one saved object per line, then ONE
+  # trailing summary line {"excludedObjects":[],...,"exportedCount":N,...}.
+  # We split summary out, sort the objects lexically by id (stable across
+  # re-exports => clean git diffs), then re-stitch with summary last.
+  local summary objects_sorted
+  summary=$(grep '"exportedCount"' "$raw" || true)
+  objects_sorted=$(mktemp)
+  grep -v '"exportedCount"' "$raw" \
+    | jq -c -s 'sort_by(.id) | .[]' \
+    > "$objects_sorted"
+
+  # Write one per-primary-object output file. If multiple --object args,
+  # group everything (incl. references) into the first one's filename.
+  local primary="${objects[0]}"
+  local primary_type="${primary%%:*}"
+  local primary_id="${primary#*:}"
+  local out_file="${dir}/kibana/${primary_type}-${primary_id}.ndjson"
+  {
+    cat "$objects_sorted"
+    [[ -n "$summary" ]] && echo "$summary"
+  } > "$out_file"
+  rm -f "$raw" "$objects_sorted"
+
+  local exported_count
+  exported_count=$(jq -r '.exportedCount // "?"' <<<"$summary" 2>/dev/null || echo "?")
+  log_info "export: ${exported_count} object(s) -> ${out_file}"
+
+  # Manifest. Two flows:
+  #   1) No manifest -> write a fresh one with this version.
+  #   2) Manifest exists with a different version -> append a changelog entry.
+  #   3) Manifest exists with this version + --force -> rewrite changelog
+  #      entry for this version in place.
+  _tpl_export_write_manifest "$dir" "$name" "$version" "$description" "$force"
+
+  # Self-lint.
+  log_info "export: linting result"
+  local lint_out
+  lint_out=$(_tpl_lint_one "$dir")
+  if echo "$lint_out" | grep -q '^FAIL'; then
+    log_error "export: lint FAILED on the exported bundle:"
+    echo "$lint_out" >&2
+    return 1
+  fi
+  log_info "export: ${name} v${version} done; lint clean"
+  log_info "       next: review files under ${dir}/ and commit"
+}
+
+# Write or update manifest.yml. v1: fresh-create handles the common case
+# cleanly; updates just touch the top fields (name/version/description)
+# and prepend a changelog entry. Existing maintainers/etc. are preserved
+# by leaving the rest of the file alone.
+_tpl_export_write_manifest() {
+  local dir="$1" name="$2" version="$3" description="$4" force="$5"
+  local manifest="${dir}/manifest.yml"
+  local now
+  now=$(date -u +%Y-%m-%d)
+
+  if [[ ! -e "$manifest" ]]; then
+    cat > "$manifest" <<EOF
+# templates/${name}/manifest.yml
+#
+# Generated by 'elk-template export' on ${now}. Edit description,
+# maintainers, fields, etc. as needed; future re-exports will append a
+# changelog entry but won't touch the rest.
+name: ${name}
+version: ${version}
+description: |
+  ${description:-Exported from Kibana on ${now}. TBD: replace this description.}
+maintainers:
+  - TBD
+
+defaults: {}
+
+fields: []
+
+changelog:
+  - version: ${version}
+    date: ${now}
+    notes: Initial export via 'elk-template export'.
+EOF
+    log_info "export: wrote new manifest ${manifest}"
+    return 0
+  fi
+
+  # Update flow.
+  local existing_version
+  existing_version=$(_tpl_manifest_field "$dir" version)
+  if [[ "$existing_version" == "$version" && $force -eq 1 ]]; then
+    log_warn "export: --force: keeping changelog as-is, bumping nothing"
+    return 0
+  fi
+
+  # Bump version + prepend changelog entry. We do this by replacing the
+  # `version:` line and inserting a fresh changelog block after the
+  # `changelog:` line, preserving whatever else the file had.
+  local tmp; tmp=$(mktemp)
+  awk -v v="$version" -v d="$now" '
+    BEGIN { ver_written=0; cl_inserted=0 }
+    /^version:[ \t]/ && !ver_written {
+      print "version: " v
+      ver_written=1
+      next
+    }
+    /^changelog:[ \t]*$/ && !cl_inserted {
+      print
+      print "  - version: " v
+      print "    date: " d
+      print "    notes: Re-exported via '\''elk-template export'\''."
+      cl_inserted=1
+      next
+    }
+    { print }
+    END {
+      if (!ver_written) print "version: " v
+      if (!cl_inserted) {
+        print "changelog:"
+        print "  - version: " v
+        print "    date: " d
+        print "    notes: Re-exported via '\''elk-template export'\''."
+      }
+    }
+  ' "$manifest" > "$tmp"
+  mv "$tmp" "$manifest"
+  log_info "export: bumped manifest to ${version} (prepended changelog)"
+}
+cmd_package() { _phase template-package; not_implemented "elk-template package"; }
+
+# Lint a single template's directory. Echoes one line per finding to fd 1:
+#   LEVEL|CHECK|MESSAGE
+# Returns 0 always (caller aggregates). LEVEL is OK | WARN | FAIL.
+_tpl_lint_one() {
+  local dir="$1"
+  local name; name=$(basename "$dir")
+  local manifest="${dir}/manifest.yml"
+
+  if [[ ! -r "$manifest" ]]; then
+    echo "FAIL|${name}|missing manifest.yml"
+    return 0
+  fi
+
+  # Manifest required fields.
+  local f m_val
+  for f in name version description; do
+    m_val=$(_tpl_manifest_field "$dir" "$f")
+    if [[ -z "$m_val" ]]; then
+      echo "FAIL|${name}|manifest missing required field: ${f}"
+    fi
+  done
+
+  # Name in manifest matches directory name.
+  m_val=$(_tpl_manifest_field "$dir" name)
+  if [[ -n "$m_val" && "$m_val" != "$name" ]]; then
+    echo "WARN|${name}|manifest name '${m_val}' != directory '${name}'"
+  fi
+
+  # ndjson line-by-line JSON validity.
+  # shellcheck disable=SC2094 # we only read $f_ndjson; echo goes to fd 1
+  _tpl_lint_ndjson_files() {
+    local _name="$1" _dir="$2"
+    local _f _line _lineno _bad=0
+    while IFS= read -r _f; do
+      _lineno=0
+      while IFS= read -r _line; do
+        _lineno=$(( _lineno + 1 ))
+        [[ -z "$_line" ]] && continue
+        if ! printf '%s' "$_line" | jq -e . >/dev/null 2>&1; then
+          echo "FAIL|${_name}|invalid JSON: $(basename "$_f"):${_lineno}"
+          _bad=1
+        fi
+      done < "$_f"
+    done < <(find "$_dir" -type f -name '*.ndjson' 2>/dev/null)
+    return "$_bad"
+  }
+  local bad=0
+  if ! _tpl_lint_ndjson_files "$name" "$dir"; then bad=1; fi
+  if (( bad == 0 )); then
+    if find "$dir" -type f -name '*.ndjson' 2>/dev/null | grep -q .; then
+      echo "OK|${name}|all ndjson lines valid"
+    fi
+  fi
+
+  # Manifest is sane YAML (yq exits non-zero on parse error).
+  if ! yq -r 'keys' "$manifest" >/dev/null 2>&1; then
+    echo "FAIL|${name}|manifest.yml is not valid YAML"
+  fi
+}
+
+cmd_lint() {
+  _phase template-lint
+  local target=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -i|--inventory) INVENTORY_PATH="$2"; shift 2 ;;
+      -h|--help)
+        cat <<'EOF'
+elk-template lint [NAME] — validate template bundles.
+
+Without NAME, lints every directory under templates/. With NAME, just that one.
+Always runs the cross-template port-collision check against inventory.yml.
+EOF
+        return 0
+        ;;
+      -*) die "lint: unknown arg '$1'" ;;
+      *) target="$1"; shift ;;
+    esac
+  done
+
+  local findings; findings=$(mktemp)
+
+  # Per-template checks.
+  local d
+  if [[ -n "$target" ]]; then
+    d=$(_tpl_dir "$target")
+    [[ -d "$d" ]] || die "lint: no such template: ${target}"
+    _tpl_lint_one "$d" >> "$findings"
+  else
+    for d in "$ELK_TEMPLATES_DIR"/*/; do
+      [[ -d "$d" ]] || continue
+      _tpl_lint_one "$d" >> "$findings"
+    done
+  fi
+
+  # Cross-template port-collision check against inventory.
+  if [[ -r "$INVENTORY_PATH" ]]; then
+    inventory::load "$INVENTORY_PATH"
+    _tpl_lint_ports >> "$findings"
+  else
+    echo "WARN|(global)|inventory not found at ${INVENTORY_PATH}; skipping port-collision check" >> "$findings"
+  fi
+
+  # Print table.
+  printf '\n  %-6s  %-20s  %s\n' LEVEL TEMPLATE/CHECK MESSAGE
+  printf '  %-6s  %-20s  %s\n' '------' '--------------------' '----------------------------------------'
+  local color level scope msg
+  while IFS='|' read -r level scope msg; do
+    if [[ -t 1 ]]; then
+      case "$level" in
+        OK)   color=$'\e[32m' ;;
+        WARN) color=$'\e[33m' ;;
+        FAIL) color=$'\e[31m' ;;
+        *)    color="" ;;
+      esac
+      printf '  %s%-6s\e[0m  %-20s  %s\n' "$color" "$level" "$scope" "$msg"
+    else
+      printf '  %-6s  %-20s  %s\n' "$level" "$scope" "$msg"
+    fi
+  done < "$findings"
+  echo
+
+  if grep -q '^FAIL|' "$findings"; then
+    log_error "lint: failures present"
+    rm -f "$findings"
+    return 1
+  fi
+  rm -f "$findings"
+  log_info "lint: ok"
+}
+
+# Port-collision check across enabled vendors in the inventory.
+_tpl_lint_ports() {
+  declare -A ext_to_vendor
+  declare -A int_to_vendor
+  local idx=0 vendor udp tcp internal
+  while read -r vendor; do
+    [[ -z "$vendor" ]] && continue
+    udp=$(inventory::vendor_field "$vendor" udp_port)
+    tcp=$(inventory::vendor_field "$vendor" tcp_port)
+    internal=$(( 5044 + idx ))
+    if [[ -z "$udp" || -z "$tcp" ]]; then
+      echo "FAIL|${vendor}|inventory: udp_port/tcp_port unset"
+      idx=$(( idx + 1 ))
+      continue
+    fi
+    # External clashes with previous vendor's external.
+    for k in "udp:${udp}" "tcp:${tcp}"; do
+      if [[ -n "${ext_to_vendor[$k]:-}" ]]; then
+        echo "FAIL|${vendor}|external ${k} collides with ${ext_to_vendor[$k]}"
+      else
+        ext_to_vendor[$k]="$vendor"
+      fi
+    done
+    # External clashes with an internal LS port.
+    if [[ -n "${int_to_vendor[$udp]:-}" ]]; then
+      echo "FAIL|${vendor}|external udp/${udp} collides with internal LS port for ${int_to_vendor[$udp]}"
+    fi
+    if [[ -n "${int_to_vendor[$tcp]:-}" ]]; then
+      echo "FAIL|${vendor}|external tcp/${tcp} collides with internal LS port for ${int_to_vendor[$tcp]}"
+    fi
+    int_to_vendor[$internal]="$vendor"
+    idx=$(( idx + 1 ))
+  done < <(inventory::vendors)
+
+  if (( idx == 0 )); then
+    echo "WARN|(global)|no enabled vendors in inventory; nothing to check"
+  else
+    echo "OK|(global)|${idx} enabled vendor(s), no port collisions"
+  fi
+}
+
+main() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -i|--inventory) INVENTORY_PATH="$2"; shift 2 ;;
+      --debug) ELK_DEBUG=1; export ELK_DEBUG; shift ;;
+      -h|--help|help) usage; exit 0 ;;
+      --) shift; break ;;
+      -*) die "unknown global option: $1" ;;
+      *) break ;;
+    esac
+  done
+  if [[ $# -eq 0 ]]; then usage; exit 0; fi
+
+  local sub="$1"; shift
+  case "$sub" in
+    list)    cmd_list    "$@" ;;
+    show)    cmd_show    "$@" ;;
+    search)  cmd_search  "$@" ;;
+    apply)   cmd_apply   "$@" ;;
+    export)  cmd_export  "$@" ;;
+    package) cmd_package "$@" ;;
+    lint)    cmd_lint    "$@" ;;
+    *) die "unknown subcommand: ${sub} (try 'elk-template --help')" ;;
+  esac
+}
+
+main "$@"

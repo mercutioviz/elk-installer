@@ -1,0 +1,385 @@
+#!/usr/bin/env bash
+# elk-install — orchestrate ELK stack install / re-apply / teardown.
+#
+# Reads an inventory file and a profile, then drives the install phases
+# against each target host over ssh from this control node.
+#
+# Status: scaffolding. Subcommands are stubs that call not_implemented().
+
+set -euo pipefail
+
+_here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "${_here}/../lib/common.sh"
+# shellcheck source=../lib/inventory.sh
+source "${_here}/../lib/inventory.sh"
+# shellcheck source=../lib/ssh.sh
+source "${_here}/../lib/ssh.sh"
+# shellcheck source=../lib/preflight.sh
+source "${_here}/../lib/preflight.sh"
+# shellcheck source=../lib/es.sh
+source "${_here}/../lib/es.sh"
+# shellcheck source=../lib/ls.sh
+source "${_here}/../lib/ls.sh"
+# shellcheck source=../lib/rsyslog.sh
+source "${_here}/../lib/rsyslog.sh"
+# shellcheck source=../lib/kibana.sh
+source "${_here}/../lib/kibana.sh"
+# shellcheck source=../lib/nginx.sh
+source "${_here}/../lib/nginx.sh"
+
+# Cleanly close any ssh multiplexed connections on exit.
+trap 'ssh::shutdown_all 2>/dev/null || true' EXIT
+
+# Global default; can be overridden with -i/--inventory.
+INVENTORY_PATH="${ELK_INVENTORY_FILE:-${_here}/../inventory.yml}"
+
+usage() {
+  cat <<'EOF'
+elk-install — orchestrate ELK stack install across target hosts.
+
+USAGE:
+  elk-install <subcommand> [options]
+
+SUBCOMMANDS:
+  init           Generate a starter inventory.yml and pick a profile
+  preflight      Run preflight checks against every target in the inventory
+  apply          Run all install phases for the chosen profile
+  reapply        Re-run idempotent phases (drift correction)
+  status         Show what is installed where, per host
+  teardown       Stop services and (optionally with --purge) remove data
+  version        Print installer version
+
+GLOBAL OPTIONS:
+  -i, --inventory PATH   Path to inventory.yml (default: ./inventory.yml)
+  -p, --profile NAME     Profile name from profiles/ (e.g. lab, small-prod, prod)
+      --check            Plan only; do not change anything
+      --assume-yes       Skip confirmation prompts (use with care)
+      --debug            Verbose logging
+
+Run `elk-install <subcommand> --help` for subcommand-specific options.
+EOF
+}
+
+cmd_init() {
+  _phase init
+  local profile="lab" force=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -p|--profile) profile="$2"; shift 2 ;;
+      --force) force=1; shift ;;
+      -h|--help)
+        cat <<'EOF'
+elk-install init — write a starter inventory.yml from a profile template.
+
+OPTIONS:
+  -p, --profile NAME   Profile to copy (default: lab)
+      --force          Overwrite an existing inventory.yml (asks first)
+EOF
+        return 0
+        ;;
+      *) die "init: unknown arg '$1'" ;;
+    esac
+  done
+
+  local src="${ELK_PROFILES_DIR}/${profile}.yml"
+  [[ -r "$src" ]] || die "init: no such profile: ${profile} (expected ${src})"
+
+  if [[ -e "$INVENTORY_PATH" && $force -eq 0 ]]; then
+    die "init: ${INVENTORY_PATH} already exists; pass --force to overwrite"
+  fi
+  if [[ -e "$INVENTORY_PATH" && $force -eq 1 ]]; then
+    confirm "Overwrite existing ${INVENTORY_PATH}?" \
+      || die "init: aborted by user"
+  fi
+  cp "$src" "$INVENTORY_PATH"
+  log_info "wrote ${INVENTORY_PATH} from profile ${profile}"
+  log_info "edit it (replace TBD entries) before running 'elk-install preflight'"
+}
+
+cmd_preflight() {
+  _phase preflight
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -i|--inventory) INVENTORY_PATH="$2"; shift 2 ;;
+      -h|--help)
+        cat <<'EOF'
+elk-install preflight — run preflight checks against every host in the inventory.
+
+OPTIONS:
+  -i, --inventory PATH   Inventory file (default: ./inventory.yml)
+EOF
+        return 0
+        ;;
+      *) die "preflight: unknown arg '$1'" ;;
+    esac
+  done
+
+  inventory::load "$INVENTORY_PATH"
+
+  local profile sv
+  profile=$(inventory::profile)
+  sv=$(inventory::stack_version)
+  log_info "inventory: ${INVENTORY_PATH}"
+  log_info "profile:   ${profile}"
+  log_info "stack:     ${sv:-(unset)}"
+
+  local any_fail=0 host
+  while read -r host; do
+    [[ -z "$host" ]] && continue
+    if ! preflight::check_target "$host"; then
+      any_fail=1
+    fi
+  done < <(inventory::hosts)
+
+  if (( any_fail )); then
+    log_error "preflight: one or more checks FAILED"
+    exit 1
+  fi
+  log_info "preflight: all hosts OK"
+}
+cmd_apply() {
+  _phase apply
+  local run_preflight=1
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --skip-preflight) run_preflight=0; shift ;;
+      -h|--help)
+        cat <<'EOF'
+elk-install apply — install configured ELK components on each host.
+
+OPTIONS:
+      --skip-preflight   Don't run preflight first (use only if you know it passed)
+
+CURRENT SCOPE (this milestone):
+  - Elasticsearch single-node lab install with security auto-config.
+  - Other roles (logstash, kibana) are not yet implemented and will be
+    reported as skipped.
+EOF
+        return 0
+        ;;
+      *) die "apply: unknown arg '$1'" ;;
+    esac
+  done
+
+  inventory::load "$INVENTORY_PATH"
+
+  local sv
+  sv=$(inventory::stack_version)
+  [[ -n "$sv" && "$sv" != "TBD" ]] \
+    || die "apply: inventory.stack_version is unset"
+
+  # Confirmation: apply IS destructive on the target (installs packages,
+  # enables services, writes config). CLAUDE.md requires us to confirm
+  # unless --assume-yes is set.
+  local host_list
+  host_list=$(inventory::hosts | paste -sd, -)
+  log_warn "apply will INSTALL packages and ENABLE services on: ${host_list}"
+  log_warn "stack version: ${sv}"
+  confirm "Proceed with install?" \
+    || die "apply: aborted by user"
+
+  if (( run_preflight )); then
+    log_info "apply: running preflight first"
+    local host any_fail=0
+    while read -r host; do
+      [[ -z "$host" ]] && continue
+      preflight::check_target "$host" || any_fail=1
+    done < <(inventory::hosts)
+    (( any_fail == 0 )) || die "apply: preflight FAILED; refusing to install"
+  fi
+
+  # Iterate hosts, install ES on anything with an es-* role, warn on
+  # other roles we don't implement yet.
+  local host roles
+  while read -r host; do
+    [[ -z "$host" ]] && continue
+    _phase "apply/${host}"
+    roles=$(inventory::roles_for "$host" | paste -sd, -)
+    log_info "host=${host} roles=${roles}"
+
+    if inventory::roles_for "$host" | grep -qE '^es-(master|data|coord)$'; then
+      es::install "$host"
+      es::configure "$host"
+      es::start "$host"
+      es::wait_for_api "$host"
+      es::reset_elastic_password "$host"
+      es::wait_for_status "$host" yellow
+    else
+      log_info "no es-* role on ${host}; skipping ES phase"
+    fi
+
+    if inventory::roles_for "$host" | grep -qx logstash; then
+      ls::install "$host"
+      ls::distribute_es_ca "$host"
+      ls::ensure_es_role_and_user "$host"
+      ls::configure_heap "$host"
+      ls::configure_keystore "$host"
+      ls::configure_pipelines "$host"
+      ls::start "$host"
+      ls::wait_for_api "$host"
+
+      rsyslog::install "$host"
+      rsyslog::configure "$host"
+      rsyslog::reload "$host"
+    fi
+
+    if inventory::roles_for "$host" | grep -qx kibana; then
+      # Find a co-located ES host for password reset + CA copy. For lab
+      # single-host that's this host itself.
+      local es_host="$host"
+      if ! inventory::roles_for "$host" | grep -qE '^es-(master|data)$'; then
+        # First host with es-master in the inventory.
+        es_host=$(inventory::hosts | while read -r h; do
+          if inventory::roles_for "$h" | grep -qx es-master; then echo "$h"; break; fi
+        done)
+        [[ -n "$es_host" ]] || die "kibana on ${host}: no es-master host in inventory"
+      fi
+
+      kibana::install "$host"
+      kibana::reset_kibana_system_password "$es_host"
+      # If kibana host != es host, the password file lives under es_host.
+      # Copy it under kibana host's key so the rest of the flow finds it.
+      if [[ "$es_host" != "$host" ]]; then
+        cp -n "${ELK_REPO_ROOT}/secrets/${es_host}.kibana_system.password" \
+              "${ELK_REPO_ROOT}/secrets/${host}.kibana_system.password"
+      fi
+      kibana::distribute_es_ca "$host" "$es_host"
+      kibana::ensure_encryption_keys "$host"
+      kibana::configure "$host" "https://$(inventory::host_field "$host" address)/"
+      kibana::configure_keystore "$host"
+      kibana::start "$host"
+      kibana::wait_for_api "$host"
+
+      nginx::install "$host"
+      nginx::self_signed_cert "$host"
+      nginx::configure_kibana_vhost "$host"
+      nginx::disable_default "$host"
+      nginx::reload "$host"
+    fi
+
+    # shellcheck disable=SC2043 # placeholder loop for future roles
+    for r in beats-receiver; do
+      if inventory::roles_for "$host" | grep -qx "$r"; then
+        log_warn "${host}: role '${r}' present but its phase is not implemented yet (skipping)"
+      fi
+    done
+  done < <(inventory::hosts)
+
+  log_info "apply: done"
+}
+cmd_reapply()   { _phase reapply;   not_implemented "elk-install reapply"; }
+cmd_status()    { _phase status;    not_implemented "elk-install status"; }
+cmd_teardown() {
+  _phase teardown
+  local purge=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --purge) purge=1; shift ;;
+      -h|--help)
+        cat <<'EOF'
+elk-install teardown — stop ELK services and remove packages.
+
+OPTIONS:
+      --purge       Also wipe data dirs, logs, apt repo + key, AND the local
+                    secrets/<host>.elastic.password file. STRONGLY destructive.
+
+DEFAULT BEHAVIOR (without --purge):
+  - Stops + disables elasticsearch.service on each host with an es-* role.
+  - Purges the elasticsearch .deb (removes binaries and /etc/elasticsearch).
+  - KEEPS /var/lib/elasticsearch (data), /var/log/elasticsearch (logs),
+    the Elastic apt repo, and the local saved password.
+
+LS / Kibana / beats teardown phases are not yet implemented.
+EOF
+        return 0
+        ;;
+      *) die "teardown: unknown arg '$1'" ;;
+    esac
+  done
+
+  inventory::load "$INVENTORY_PATH"
+
+  local host_list
+  host_list=$(inventory::hosts | paste -sd, -)
+  if (( purge )); then
+    log_warn "teardown --purge will REMOVE Elasticsearch AND WIPE data, logs, apt repo, and local secrets on: ${host_list}"
+    log_warn "this is STRONGLY DESTRUCTIVE. There is no undo."
+  else
+    log_warn "teardown will stop + purge the elasticsearch package on: ${host_list}"
+    log_warn "data dirs (/var/lib/elasticsearch) and local secrets will be KEPT"
+  fi
+  confirm "Proceed with teardown?" \
+    || die "teardown: aborted by user"
+
+  local host
+  while read -r host; do
+    [[ -z "$host" ]] && continue
+    _phase "teardown/${host}"
+
+    # Teardown order matters: LS/rsyslog first (they depend on ES being
+    # up to delete the user/role on --purge), then ES. Kibana when ready.
+    if inventory::roles_for "$host" | grep -qx logstash; then
+      rsyslog::teardown "$host" "$purge"
+      ls::teardown "$host" "$purge"
+    fi
+
+    if inventory::roles_for "$host" | grep -qE '^es-(master|data|coord)$'; then
+      es::teardown "$host" "$purge"
+    elif ! inventory::roles_for "$host" | grep -qx logstash; then
+      log_info "no es-* or logstash role on ${host}; nothing to tear down"
+    fi
+
+    if inventory::roles_for "$host" | grep -qx kibana; then
+      nginx::teardown "$host" "$purge"
+      kibana::teardown "$host" "$purge"
+    fi
+
+    # shellcheck disable=SC2043 # placeholder loop for future roles
+    for r in beats-receiver; do
+      if inventory::roles_for "$host" | grep -qx "$r"; then
+        log_warn "${host}: role '${r}' teardown not implemented yet (skipping)"
+      fi
+    done
+  done < <(inventory::hosts)
+
+  log_info "teardown: done"
+}
+
+cmd_version() {
+  # Versioned with the repo; pinned stack version lives in the inventory.
+  echo "elk-installer (scaffolding) — see git log for revision"
+}
+
+main() {
+  # Parse global options that may appear before the subcommand.
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -i|--inventory) INVENTORY_PATH="$2"; shift 2 ;;
+      --assume-yes)   ELK_ASSUME_YES=1; export ELK_ASSUME_YES; shift ;;
+      --debug)        ELK_DEBUG=1; export ELK_DEBUG; shift ;;
+      -h|--help|help) usage; exit 0 ;;
+      --) shift; break ;;
+      -*) die "unknown global option: $1 (try 'elk-install --help')" ;;
+      *)  break ;;
+    esac
+  done
+
+  if [[ $# -eq 0 ]]; then
+    usage; exit 0
+  fi
+
+  local sub="$1"; shift
+  case "$sub" in
+    init)      cmd_init "$@" ;;
+    preflight) cmd_preflight "$@" ;;
+    apply)     cmd_apply "$@" ;;
+    reapply)   cmd_reapply "$@" ;;
+    status)    cmd_status "$@" ;;
+    teardown)  cmd_teardown "$@" ;;
+    version)   cmd_version ;;
+    *) die "unknown subcommand: ${sub} (try 'elk-install --help')" ;;
+  esac
+}
+
+main "$@"
