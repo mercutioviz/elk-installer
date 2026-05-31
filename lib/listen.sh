@@ -60,6 +60,13 @@ listen::tokenize_vendor_conf() {
     internal_port=$(( 5044 + idx ))
   fi
 
+  # Resolve ES host; fall back to 127.0.0.1 for offline syntax checking
+  # (preflight / syntax-check runs where no real ES exists yet).
+  local es_host="127.0.0.1"
+  if es_host=$(inventory::es_host_address 2>/dev/null); then
+    : # got it from inventory
+  fi
+
   local f had=0
   for f in "$dir"/*.conf; do
     [[ -e "$f" ]] || continue
@@ -70,6 +77,8 @@ listen::tokenize_vendor_conf() {
       -e "s|__LS_INTERNAL_PORT__|${internal_port}|g" \
       -e "s|__LS_ES_USER__|logstash_internal|g" \
       -e "s|__LS_ES_CA_PATH__|/etc/logstash/certs/elasticsearch-http-ca.crt|g" \
+      -e "s|__ES_HOST__|${es_host}|g" \
+      -e "s|__PATTERNS_DIR__|/etc/logstash/patterns|g" \
       "$f"
     echo
   done

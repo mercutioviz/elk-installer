@@ -1,0 +1,20 @@
+# Barracuda WaaS syslog grok patterns
+
+# WAAS_QFIELD: a WaaS quoted field.
+#   Non-null:  "some value"  → captured without outer quotes
+#   Null:      ""-""         → field absent
+WAAS_QFIELD (?:""-""|"(?:[^"]*)")
+
+# WAAS_HDR_SKIP: consume everything before the WaaS body.
+# rsyslog prepends a header whose format varies:
+#   ISO8601 (FileFormat): "2026-05-31T20:29:58+00:00 Barracuda "
+#   RFC3164 (ForwardFormat): "<132>May 31 20:29:57 Barracuda "
+#
+# The WaaS body ALWAYS starts with "YYYY-MM-DD HH" (date, SPACE, digits).
+# The rsyslog ISO8601 timestamp uses "T" between date and time — never a space.
+# This lookahead anchors precisely at the WaaS body without caring about the
+# header format, making the pipeline resilient to rsyslog template changes.
+WAAS_HDR_SKIP .*?(?=\d{4}-\d{2}-\d{2} \d)
+
+# WaaS %t — 3 tokens: date time tz
+WAAS_TIMESTAMP %{YEAR:t_year}-%{MONTHNUM:t_month}-%{MONTHDAY:t_day}\s+%{TIME:t_time}\s+%{ISO8601_TIMEZONE:t_tz}

@@ -90,3 +90,20 @@ inventory::vendor_field() {
 inventory::kibana_fqdn()           { _inv::_yq '.kibana.public_fqdn // ""'; }
 inventory::kibana_email()          { _inv::_yq '.kibana.letsencrypt_email // ""'; }
 inventory::kibana_allowed_cidrs()  { _inv::_yq '.kibana.allowed_cidrs[]? // empty'; }
+
+# Return the address of the first host carrying the es-master role.
+# Used by LS and Kibana modules to know where to reach Elasticsearch when
+# ES lives on a different host from LS or Kibana.
+inventory::es_host_address() {
+  local h
+  while read -r h; do
+    # shellcheck disable=SC2016
+    if _inv::_yq --arg h "$h" \
+         '.hosts[] | select(.name == $h) | .roles[]?' \
+       | grep -qx 'es-master'; then
+      inventory::host_field "$h" address
+      return 0
+    fi
+  done < <(inventory::hosts)
+  return 1
+}

@@ -125,12 +125,12 @@ EOF
   log_info "stack:     ${sv:-(unset)}"
 
   local any_fail=0 host
-  while read -r host; do
+  while IFS= read -r -u 3 host; do
     [[ -z "$host" ]] && continue
     if ! preflight::check_target "$host"; then
       any_fail=1
     fi
-  done < <(inventory::hosts)
+  done 3< <(inventory::hosts)
 
   if (( any_fail )); then
     log_error "preflight: one or more checks FAILED"
@@ -182,17 +182,17 @@ EOF
   if (( run_preflight )); then
     log_info "apply: running preflight first"
     local host any_fail=0
-    while read -r host; do
+    while IFS= read -r -u 4 host; do
       [[ -z "$host" ]] && continue
       preflight::check_target "$host" || any_fail=1
-    done < <(inventory::hosts)
+    done 4< <(inventory::hosts)
     (( any_fail == 0 )) || die "apply: preflight FAILED; refusing to install"
   fi
 
   # Iterate hosts, install ES on anything with an es-* role, warn on
   # other roles we don't implement yet.
   local host roles
-  while read -r host; do
+  while IFS= read -r -u 3 host; do
     [[ -z "$host" ]] && continue
     _phase "apply/${host}"
     roles=$(inventory::roles_for "$host" | paste -sd, -)
@@ -210,8 +210,17 @@ EOF
     fi
 
     if inventory::roles_for "$host" | grep -qx logstash; then
+      # Resolve ES host for CA distribution + role/user creation.
+      local ls_es_host="$host"
+      if ! inventory::roles_for "$host" | grep -qE '^es-(master|data)$'; then
+        ls_es_host=$(inventory::hosts | while read -r h; do
+          if inventory::roles_for "$h" | grep -qx es-master; then echo "$h"; break; fi
+        done)
+        [[ -n "$ls_es_host" ]] || die "logstash on ${host}: no es-master host in inventory"
+      fi
+
       ls::install "$host"
-      ls::distribute_es_ca "$host"
+      ls::distribute_es_ca "$host" "$ls_es_host"
       ls::ensure_es_role_and_user "$host"
       ls::configure_heap "$host"
       ls::configure_keystore "$host"
@@ -225,11 +234,9 @@ EOF
     fi
 
     if inventory::roles_for "$host" | grep -qx kibana; then
-      # Find a co-located ES host for password reset + CA copy. For lab
-      # single-host that's this host itself.
+      # Find the ES host for password reset + CA distribution.
       local es_host="$host"
       if ! inventory::roles_for "$host" | grep -qE '^es-(master|data)$'; then
-        # First host with es-master in the inventory.
         es_host=$(inventory::hosts | while read -r h; do
           if inventory::roles_for "$h" | grep -qx es-master; then echo "$h"; break; fi
         done)
@@ -238,15 +245,23 @@ EOF
 
       kibana::install "$host"
       kibana::reset_kibana_system_password "$es_host"
-      # If kibana host != es host, the password file lives under es_host.
-      # Copy it under kibana host's key so the rest of the flow finds it.
       if [[ "$es_host" != "$host" ]]; then
         cp -n "${ELK_REPO_ROOT}/secrets/${es_host}.kibana_system.password" \
               "${ELK_REPO_ROOT}/secrets/${host}.kibana_system.password"
       fi
       kibana::distribute_es_ca "$host" "$es_host"
       kibana::ensure_encryption_keys "$host"
-      kibana::configure "$host" "https://$(inventory::host_field "$host" address)/"
+
+      local fqdn email public_base_url
+      fqdn=$(inventory::kibana_fqdn)
+      email=$(inventory::kibana_email)
+      if [[ -n "$fqdn" && "$fqdn" != "TBD" ]]; then
+        public_base_url="https://${fqdn}/"
+      else
+        public_base_url="https://$(inventory::host_field "$host" address)/"
+      fi
+
+      kibana::configure "$host" "$public_base_url"
       kibana::configure_keystore "$host"
       kibana::start "$host"
       kibana::wait_for_api "$host"
@@ -256,6 +271,14 @@ EOF
       nginx::configure_kibana_vhost "$host"
       nginx::disable_default "$host"
       nginx::reload "$host"
+
+      # Let's Encrypt — only when both fqdn + email are set and not TBD.
+      if [[ -n "$fqdn" && "$fqdn" != "TBD" && -n "$email" && "$email" != "TBD" ]]; then
+        nginx::letsencrypt "$host" "$fqdn" "$email"
+      elif [[ -n "$fqdn" && "$fqdn" != "TBD" ]]; then
+        log_warn "kibana: public_fqdn is set but letsencrypt_email is TBD — using self-signed"
+        log_warn "         set letsencrypt_email in inventory.yml and re-run apply to get LE cert"
+      fi
     fi
 
     # shellcheck disable=SC2043 # placeholder loop for future roles
@@ -264,7 +287,7 @@ EOF
         log_warn "${host}: role '${r}' present but its phase is not implemented yet (skipping)"
       fi
     done
-  done < <(inventory::hosts)
+  done 3< <(inventory::hosts)
 
   log_info "apply: done"
 }
@@ -313,7 +336,7 @@ EOF
     || die "teardown: aborted by user"
 
   local host
-  while read -r host; do
+  while IFS= read -r -u 3 host; do
     [[ -z "$host" ]] && continue
     _phase "teardown/${host}"
 
@@ -341,7 +364,7 @@ EOF
         log_warn "${host}: role '${r}' teardown not implemented yet (skipping)"
       fi
     done
-  done < <(inventory::hosts)
+  done 3< <(inventory::hosts)
 
   log_info "teardown: done"
 }

@@ -128,7 +128,11 @@ kibana::configure() {
   k_report=$(awk -F= '/^reporting=/{print $2; exit}' "$keys_file")
   k_sec=$(awk -F= '/^security=/{print $2; exit}' "$keys_file")
 
-  log_info "kibana: writing managed kibana.yml block on ${host}"
+  local es_host
+  es_host=$(inventory::es_host_address) \
+    || die "kibana::configure: cannot resolve ES host"
+
+  log_info "kibana: writing managed kibana.yml block on ${host} (ES host: ${es_host})"
   ssh::exec "$host" "sudo bash -s" <<REMOTE
 set -euo pipefail
 begin="${KBN_MANAGED_BEGIN}"
@@ -143,7 +147,7 @@ server.host: "127.0.0.1"
 server.port: 5601
 $(if [[ -n "$public_base_url" ]]; then echo "server.publicBaseUrl: \"${public_base_url}\""; fi)
 
-elasticsearch.hosts: ["https://127.0.0.1:9200"]
+elasticsearch.hosts: ["https://${es_host}:9200"]
 elasticsearch.username: "kibana_system"
 # password lives in the kibana keystore (key: elasticsearch.password)
 elasticsearch.ssl.certificateAuthorities: ["/etc/kibana/certs/elasticsearch-http-ca.crt"]

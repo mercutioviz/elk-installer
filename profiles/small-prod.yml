@@ -1,16 +1,67 @@
-# profiles/small-prod.yml — three-host prod-ish layout.
+# profiles/small-prod.yml — three-host ELK split into ES / LS / Kibana
 #
-# Status: stub. Fill in once the lab profile is fully exercised end-to-end.
-# Intended shape:
-#   - elk-es-01:     es-master + es-data
-#   - elk-ls-01:     logstash + rsyslog front door
-#   - elk-kbn-01:    kibana + nginx + LE
-#
-# Use lab.yml as the schema reference; this file will mirror it with
-# three hosts and split roles.
+# Host layout:
+#   elk-es-01:   es-master + es-data
+#   elk-ls-01:   logstash  (+ rsyslog front door)
+#   elk-kbn-01:  kibana    (+ nginx + Let's Encrypt)
 
 profile: small-prod
-description: Three-host ELK split into ES / LS / Kibana (TBD).
+description: Three-host ELK — separate ES, LS, and Kibana nodes.
 
 stack_version: TBD
-hosts: []
+
+hosts:
+  - name: elk-es-01
+    address: TBD
+    ssh_user: admin
+    ssh_key: ~/.ssh/AWS-USEast2-Key.pem
+    roles:
+      - es-master
+      - es-data
+
+  - name: elk-ls-01
+    address: TBD
+    ssh_user: admin
+    ssh_key: ~/.ssh/AWS-USEast2-Key.pem
+    roles:
+      - logstash
+
+  - name: elk-kbn-01
+    address: TBD
+    ssh_user: admin
+    ssh_key: ~/.ssh/AWS-USEast2-Key.pem
+    roles:
+      - kibana
+
+tls:
+  ca_subject: "CN=elk-small-prod CA"
+  cert_validity_days: 825
+
+kibana:
+  public_fqdn: TBD
+  letsencrypt_email: TBD
+  allowed_cidrs:
+    - TBD
+
+firewall:
+  manage: true
+  intra_cluster_cidrs:
+    - TBD
+
+templates:
+  - name: generic-syslog
+    enabled: true
+    udp_port: 5140
+    tcp_port: 5140
+  - name: barracuda-waf
+    enabled: true
+    udp_port: 5141
+    tcp_port: 5141
+
+os_tuning:
+  set_vm_max_map_count: true
+  disable_swap: false    # swap files added intentionally on t3.medium
+
+self_monitoring:
+  metricbeat: false
+  filebeat:   false

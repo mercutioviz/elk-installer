@@ -1,87 +1,72 @@
-# inventory.yml — first lab target on AWS us-east-2.
-#
-# Generated 2026-05-29 from a manual preflight against 10.10.30.78.
-# TBD entries must be set before the corresponding install phase runs.
-# Schema reference: profiles/lab.yml.
+# inventory.yml — small-prod deployment on AWS us-east-2
+# Three hosts in the same VPC/subnet: ES, LS, Kibana.
+# Generated 2026-05-30 from profile small-prod.
 
-profile: lab
+profile: small-prod
 
-# -----------------------------------------------------------------------------
-# Stack version — pinned to latest 9.x patch as of 2026-05-29.
-# Source: https://artifacts.elastic.co/packages/9.x/apt — verified, not guessed.
-# -----------------------------------------------------------------------------
+# Pinned to latest 9.x patch as of 2026-05-29. Verified from Elastic apt repo.
 stack_version: "9.4.2"
 
-# -----------------------------------------------------------------------------
-# Hosts.
-# -----------------------------------------------------------------------------
 hosts:
-  - name: elk-lab-01
-    # Real host info confirmed via ssh on 2026-05-29:
-    #   hostname:       ip-10-10-30-78
-    #   private ip:     10.10.30.78
-    #   public ip:      18.217.134.40
-    #   instance id:    i-08b727c07c254b797 (t3.medium, us-east-2)
-    #   OS:             Debian 13 (trixie), kernel 6.12.74, amd64
-    #   RAM:            3.8 GiB  (tight for all-in-one; consider t3.large)
-    #   Disk:           30 GiB root, 1.1 GiB used
-    address: 10.10.30.78
+  - name: elk-es-01
+    # Debian 13, t3.medium, us-east-2
+    address: 10.10.24.233
     ssh_user: admin
     ssh_key: ~/.ssh/AWS-USEast2-Key.pem
     roles:
       - es-master
       - es-data
+
+  - name: elk-ls-01
+    # Debian 13, t3.medium, us-east-2
+    address: 10.10.29.245
+    ssh_user: admin
+    ssh_key: ~/.ssh/AWS-USEast2-Key.pem
+    roles:
       - logstash
+
+  - name: elk-kbn-01
+    # Debian 13, t3.medium, us-east-2; EIP 3.150.78.176 DNS: elk.waaslab.com
+    address: 10.10.31.12
+    ssh_user: admin
+    ssh_key: ~/.ssh/AWS-USEast2-Key.pem
+    roles:
       - kibana
 
-# -----------------------------------------------------------------------------
-# TLS — lab defaults: self-signed internal CA stored under secrets/.
-# -----------------------------------------------------------------------------
 tls:
-  ca_subject: "CN=elk-lab CA"
+  ca_subject: "CN=elk-small-prod CA"
   cert_validity_days: 825
 
-# -----------------------------------------------------------------------------
-# Kibana — TBD whether to expose publicly + use Let's Encrypt.
-# -----------------------------------------------------------------------------
 kibana:
-  public_fqdn: ""            # private-only for this lab; LE deferred
-  letsencrypt_email: ""
+  public_fqdn: "elk.waaslab.com"
+  letsencrypt_email: "mscollins@barracuda.com"
   allowed_cidrs:
-    - 10.10.0.0/16           # VPC CIDR (inferred from 10.10.30.78)
-    - 108.240.247.96/32      # admin workstation (added 2026-05-30 for public-IP access)
+    - 10.10.0.0/16             # VPC
+    - 108.240.247.96/32        # admin workstation
 
-# -----------------------------------------------------------------------------
-# Firewall — nftables not installed on the host yet; the firewall phase
-# will install it and manage a table named `elk` only.
-# -----------------------------------------------------------------------------
 firewall:
   manage: true
   intra_cluster_cidrs:
-    - 127.0.0.1/32           # single host
+    - 10.10.0.0/16
 
-# -----------------------------------------------------------------------------
-# Vendor templates — start with generic-syslog only. Barracuda templates
-# remain scaffolding-only until the export workflow lands.
-# -----------------------------------------------------------------------------
 templates:
   - name: generic-syslog
     enabled: true
     udp_port: 5140
     tcp_port: 5140
-
   - name: barracuda-waf
+    enabled: true
+    udp_port: 5142
+    tcp_port: 5142
+
+  - name: barracuda-waas
     enabled: true
     udp_port: 5141
     tcp_port: 5141
 
-# -----------------------------------------------------------------------------
-# OS tuning — swap is already off; vm.max_map_count needs verification
-# (sysctl wasn't on the non-interactive PATH; preflight will use abs path).
-# -----------------------------------------------------------------------------
 os_tuning:
   set_vm_max_map_count: true
-  disable_swap: true
+  disable_swap: false    # 4GB swapfiles created intentionally on t3.medium
 
 self_monitoring:
   metricbeat: false

@@ -108,14 +108,17 @@ echo "cert: generated"
 REMOTE
 }
 
+# nginx::configure_kibana_vhost HOST [CERT_PATH] [KEY_PATH]
+# CERT_PATH / KEY_PATH default to the self-signed paths; pass LE paths
+# after certbot has obtained a certificate.
 nginx::configure_kibana_vhost() {
   local host="$1"
+  local crt="${2:-$NGINX_CERT}"
+  local key="${3:-$NGINX_KEY}"
   local allowed_cidrs
   allowed_cidrs=$(inventory::kibana_allowed_cidrs | paste -sd ',' -)
   log_info "nginx: writing kibana vhost on ${host} (allow=${allowed_cidrs:-any})"
 
-  # Build the allow/deny block. If no CIDRs configured, allow all (still
-  # behind AWS SG anyway). Otherwise: allow each + deny all.
   local allow_block=""
   if [[ -n "$allowed_cidrs" ]]; then
     while IFS= read -r c; do
@@ -128,8 +131,8 @@ nginx::configure_kibana_vhost() {
   ssh::exec "$host" "sudo bash -s" <<REMOTE
 set -euo pipefail
 vhost="${NGINX_VHOST}"
-crt="${NGINX_CERT}"
-key="${NGINX_KEY}"
+crt="${crt}"
+key="${key}"
 
 cat > "\$vhost" <<EOF
 # elk-installer managed. Hand edits will be overwritten.
@@ -191,6 +194,56 @@ if [ -e /etc/nginx/sites-enabled/default ]; then
   echo "default site disabled"
 fi
 REMOTE
+}
+
+# nginx::letsencrypt HOST FQDN EMAIL
+# Install certbot, obtain a certificate for FQDN via the nginx plugin
+# (nginx must already be running with a server block matching FQDN),
+# then rewrite the vhost to use the LE certificate paths.
+nginx::letsencrypt() {
+  local host="$1" fqdn="$2" email="$3"
+  [[ -n "$fqdn" && -n "$email" ]] \
+    || die "nginx::letsencrypt: fqdn and email are required"
+
+  log_info "nginx: installing certbot on ${host}"
+  ssh::exec "$host" "sudo bash -s" <<'REMOTE'
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+if ! dpkg-query -s certbot >/dev/null 2>&1; then
+  apt-get update -qq
+  apt-get install -y -qq certbot python3-certbot-nginx
+fi
+echo "certbot: $(certbot --version 2>&1 | head -1)"
+REMOTE
+
+  log_info "nginx: obtaining Let's Encrypt cert for ${fqdn}"
+  # Certbot must run as root. --nginx plugin handles ACME challenge via
+  # the running nginx (port 80 must be reachable from LE servers).
+  # certonly = we manage the vhost ourselves; certbot only fetches the cert.
+  ssh::exec "$host" "sudo FQDN=$(printf '%q' "$fqdn") EMAIL=$(printf '%q' "$email") bash -s" <<'REMOTE'
+set -euo pipefail
+certbot certonly --nginx \
+  -d "$FQDN" \
+  --email "$EMAIL" \
+  --agree-tos \
+  --non-interactive \
+  --expand \
+  2>&1
+# Verify cert file was actually created before declaring success.
+test -s "/etc/letsencrypt/live/$FQDN/fullchain.pem" \
+  || { echo "certbot: cert file missing after run"; exit 1; }
+echo "certbot: cert obtained for $FQDN"
+REMOTE
+
+  # Only swap vhost if certbot succeeded (cert files exist).
+  local le_cert="/etc/letsencrypt/live/${fqdn}/fullchain.pem"
+  local le_key="/etc/letsencrypt/live/${fqdn}/privkey.pem"
+  log_info "nginx: switching vhost to LE cert (${le_cert})"
+  nginx::configure_kibana_vhost "$host" "$le_cert" "$le_key"
+  nginx::reload "$host"
+
+  log_info "nginx: Let's Encrypt cert live for ${fqdn}"
+  log_info "nginx: auto-renewal via certbot systemd timer (verify: systemctl status certbot.timer)"
 }
 
 nginx::reload() {

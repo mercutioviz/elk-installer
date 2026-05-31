@@ -32,6 +32,9 @@ LS_DEFAULT_HEAP="512m"
 LS_ES_USER="logstash_internal"
 LS_PIPELINE_PORT_BASE=5044   # generic-syslog: 5044, next vendor: 5045, ...
 
+# Target-side directory for per-vendor grok patterns.
+LS_PATTERNS_DIR="/etc/logstash/patterns"
+
 # (No managed-block markers needed — we own pipelines.yml entirely now.)
 
 ls::install() {
@@ -76,7 +79,19 @@ REMOTE
 # in sync.
 ls::ensure_es_role_and_user() {
   local host="$1"
-  local es_pw_file="${ELK_REPO_ROOT}/secrets/${host}.elastic.password"
+  # Elastic password is saved under the ES host name, not the LS host name.
+  # Resolve the ES host name first so we look in the right place.
+  local es_addr
+  es_addr=$(inventory::es_host_address)     || die "ls::ensure_es_role_and_user: cannot resolve ES host address"
+  local es_host_early
+  while IFS= read -r -u 5 h; do
+    if [[ "$(inventory::host_field "$h" address)" == "$es_addr" ]]; then
+      es_host_early="$h"; break
+    fi
+  done 5< <(inventory::hosts)
+  [[ -n "$es_host_early" ]]     || die "ls::ensure_es_role_and_user: no inventory host matches ES address ${es_addr}"
+
+  local es_pw_file="${ELK_REPO_ROOT}/secrets/${es_host_early}.elastic.password"
   local ls_pw_file="${ELK_REPO_ROOT}/secrets/${host}.${LS_ES_USER}.password"
   [[ -s "$es_pw_file" ]] || die "ls: no elastic password at ${es_pw_file}"
 
@@ -97,8 +112,10 @@ ls::ensure_es_role_and_user() {
     log_warn "ls: generated ${LS_ES_USER} password saved PLAINTEXT to ${ls_pw_file}"
   fi
 
-  log_info "ls: ensuring logstash_writer role + ${LS_ES_USER} user via ES API"
-  ssh::exec "$host" "ES_PW=$(printf '%q' "$es_pw") LS_PW=$(printf '%q' "$ls_pw") bash -s" <<'REMOTE'
+  # Reuse es_host_early / es_addr resolved above for the curl target.
+  log_info "ls: ensuring logstash_writer role + ${LS_ES_USER} user via ES API on ${es_host_early}"
+
+  ssh::exec "$es_host_early" "ES_PW=$(printf '%q' "$es_pw") LS_PW=$(printf '%q' "$ls_pw") bash -s" <<'REMOTE'
 set -euo pipefail
 api="https://127.0.0.1:9200"
 curl_args=( -sSk -u "elastic:${ES_PW}" -H 'Content-Type: application/json' )
@@ -129,6 +146,32 @@ case "$code" in
 esac
 rm -f /tmp/user_resp.json
 REMOTE
+}
+
+
+# Deploy any grok pattern files from templates/<vendor>/logstash/patterns/
+# to LS_PATTERNS_DIR on the target. Idempotent: files are overwritten.
+_ls::deploy_patterns() {
+  local host="$1" vendor="$2"
+  local src_dir="${ELK_TEMPLATES_DIR}/${vendor}/logstash/patterns"
+  [[ -d "$src_dir" ]] || return 0
+  local f
+  for f in "$src_dir"/*; do
+    [[ -e "$f" ]] || continue
+    local content basename
+    basename=$(basename "$f")
+    content=$(cat "$f")
+    log_info "ls: deploying pattern file ${basename} for ${vendor}"
+    ssh::exec "$host" "sudo bash -s" <<REMOTE
+set -euo pipefail
+install -d -m 0755 "${LS_PATTERNS_DIR}"
+cat > "${LS_PATTERNS_DIR}/${basename}" <<'PAT'
+${content}
+PAT
+chmod 0644 "${LS_PATTERNS_DIR}/${basename}"
+echo "pattern ${basename}: ok"
+REMOTE
+  done
 }
 
 ls::configure_heap() {
@@ -191,6 +234,9 @@ REMOTE
 _ls::tokenize_template() {
   local file="$1" vendor="$2" internal_port="$3"
   local dataset="${vendor//-/.}"
+  local es_host
+  es_host=$(inventory::es_host_address) \
+    || die "_ls::tokenize_template: cannot resolve ES host (no es-master in inventory)"
   # NOTE: we use | as the sed delimiter to avoid clashes with paths.
   sed \
     -e "s|__VENDOR__|${vendor}|g" \
@@ -198,6 +244,8 @@ _ls::tokenize_template() {
     -e "s|__LS_INTERNAL_PORT__|${internal_port}|g" \
     -e "s|__LS_ES_USER__|${LS_ES_USER}|g" \
     -e "s|__LS_ES_CA_PATH__|/etc/logstash/certs/elasticsearch-http-ca.crt|g" \
+    -e "s|__ES_HOST__|${es_host}|g" \
+    -e "s|__PATTERNS_DIR__|${LS_PATTERNS_DIR}|g" \
     "$file"
 }
 
@@ -274,6 +322,7 @@ ls::configure_pipelines() {
     then
       vendor_confs+=$(cat /tmp/.ls_vendor_tmp)
       log_info "ls: using template templates/${vendor}/logstash/*.conf"
+      _ls::deploy_patterns "$host" "$vendor"
     else
       log_warn "ls: no template logstash conf for ${vendor}; using placeholder"
       vendor_confs+=$(_ls::placeholder_conf "$vendor" "$internal_port")

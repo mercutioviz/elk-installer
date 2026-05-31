@@ -107,6 +107,7 @@ ruleset(name="elk_${vendor//-/_}") {
          file="/var/log/elk-ingest/${vendor}/raw.log")
   action(type="omfwd"
          target="127.0.0.1" port="${internal}" protocol="tcp"
+         template="RSYSLOG_FileFormat"
          action.resumeRetryCount="-1"
          queue.type="LinkedList" queue.size="10000")
   stop

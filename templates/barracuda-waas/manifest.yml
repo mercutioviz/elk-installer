@@ -1,0 +1,90 @@
+name: barracuda-waas
+version: 0.1.0
+description: |
+  Barracuda WAF-as-a-Service (WaaS) syslog ingest.
+  Parses both TR (Traffic/Access) and WF (Web Firewall) record types
+  into separate ECS-shaped data streams.
+
+  TR → logs-barracuda.waas.access-default
+  WF → logs-barracuda.waas.firewall-default
+
+maintainers:
+  - mscollins@barracuda.com
+
+defaults:
+  udp_port: 5142
+  tcp_port: 5142
+
+contents:
+  rsyslog:       []
+  logstash:      ["logstash/30-barracuda-waas.conf"]
+  elasticsearch:
+    component_templates: []
+    index_templates:     []
+    ilm_policies:        []
+  kibana:
+    data_views: []
+    dashboards: []
+
+fields:
+  # rsyslog header (stripped during processing)
+  - name: "@timestamp"
+    type: date
+  # TR + WF common
+  - name: "source.ip"
+    type: ip
+  - name: "source.port"
+    type: long
+  - name: "destination.ip"
+    type: ip
+  - name: "destination.port"
+    type: long
+  - name: "http.request.method"
+    type: keyword
+  - name: "url.path"
+    type: wildcard
+  - name: "url.query"
+    type: wildcard
+  - name: "user_agent.original"
+    type: keyword
+  - name: "network.transport"
+    type: keyword
+  - name: "source.geo.country_iso_code"
+    type: keyword
+  # TR specific
+  - name: "http.response.status_code"
+    type: long
+  - name: "http.response.body.bytes"
+    type: long
+  - name: "http.request.referrer"
+    type: wildcard
+  - name: "waas.unit_name"
+    type: keyword
+  - name: "waas.log_type"
+    type: keyword
+  - name: "waas.response_type"
+    type: keyword
+  - name: "waas.protected"
+    type: keyword
+  - name: "waas.wf_matched"
+    type: keyword
+  - name: "waas.event_id"
+    type: keyword
+  # WF specific
+  - name: "waas.severity"
+    type: keyword
+  - name: "waas.attack_type"
+    type: keyword
+  - name: "waas.action"
+    type: keyword
+  - name: "waas.attack_detail"
+    type: text
+
+changelog:
+  - version: 0.1.0
+    date: 2026-05-31
+    notes: |
+      Initial pipeline. Parses WaaS custom syslog format with quoted fields.
+      Handles ""-"" double-double-quoted nulls, multi-word UAs, GREEDYDATA %adl.
+      Both TR (access) and WF (firewall) record types routed to separate
+      data streams.
