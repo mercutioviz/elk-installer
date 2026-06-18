@@ -130,6 +130,52 @@ shellcheck -x -e SC1091 bin/* lib/*.sh   # currently clean
 7. Discover renders the events with `@timestamp`, `host.hostname`,
    `message`, `data_stream.*`, etc.
 
+## Barracuda WaaS log export configuration
+
+The `barracuda-waas` template requires specific **KEY=VALUE** format strings
+configured in the WaaS portal. See `templates/barracuda-waas/README.md` for
+complete field tables. Quick reference:
+
+### Where to configure
+
+1. Log in to the Barracuda WaaS portal and select your application.
+2. Navigate to **Log > Export Log > Syslog**.
+3. Set the **Syslog Server** to the IP of the Logstash/rsyslog host and
+   **Port** to `5141`. **TCP** is preferred over UDP.
+4. Paste the format strings below into the respective format fields.
+5. Save and enable. Events appear in Kibana within seconds.
+
+> **Syslog header settings** (facility, severity, protocol version): no
+> specific values required — rsyslog normalizes the header to ISO8601 before
+> forwarding to Logstash. Leave at WaaS defaults.
+
+### Access Log format string (TR)
+
+Paste verbatim into the **Access Log** format field:
+
+```
+TS=%t UN=%un LT=%lt AI=%ai AP=%ap CI=%ci CP=%cp ID=%id CU=%cu M=%m P=%p H=%h V=%v S=%s BS=%bs BR=%br CH=%ch TT=%tt SI=%si SP=%sp ST=%st SID=%sid RTF=%rtf PMF=%pmf PF=%pf WMF=%wmf U=%u Q=%q R=%r C=%c UA="%ua" PX=%px PP=%pp AU=%au CS1=%cs1 CS2=%cs2 CS3=%cs3 CC=%cc UID=%uid
+```
+
+### Web Firewall Log format string (WF)
+
+Paste verbatim into the **Web Firewall Log** format field:
+
+```
+TS=%t UN=%un LT=%lt SL=%sl AD=%ad CI=%ci CP=%cp AI=%ai AP=%ap RI=%ri RT=%rt AT=%at FA=%fa M=%m U=%u Q=%q P=%p SID=%sid UA="%ua" PX=%px PP=%pp AU=%au R=%r CC=%cc UID=%uid ADL=%adl
+```
+
+### Data streams and field mapping summary
+
+| Log type | Data stream | Key ECS fields |
+|---|---|---|
+| TR (access) | `logs-barracuda.waas.access-default` | `source.ip`, `url.path`, `http.response.status_code`, `user_agent.original`, `waas.time_taken_ms` |
+| WF (firewall) | `logs-barracuda.waas.firewall-default` | `source.ip`, `waas.attack_type`, `waas.severity`, `event.action`, `waas.attack_detail` |
+
+`UA="%ua"` must include the surrounding double-quotes in the format string —
+the `kv` filter cannot parse quoted multi-word values, so the UA is extracted
+by a separate grok step and the quotes are part of the delimiter.
+
 ## Contributing
 
 Read [`CLAUDE.md`](CLAUDE.md) first. Short version: accuracy over speed,
