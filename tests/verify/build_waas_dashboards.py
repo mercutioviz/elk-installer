@@ -32,7 +32,8 @@ def kbn(method, url, password, body=None):
     ctx.verify_mode = __import__("ssl").CERT_NONE
     try:
         with urllib.request.urlopen(req, context=ctx, timeout=15) as r:
-            return json.loads(r.read())
+            data = r.read()
+            return json.loads(data) if data else {}
     except urllib.error.HTTPError as e:
         body_text = e.read().decode()
         print(f"  HTTP {e.code} {method} {url}: {body_text[:200]}")
@@ -222,6 +223,237 @@ def table_vis(dv_id, field, size=15, extra_metrics=None):
         }
     }, {"index": dv_id, "query": {"query": "", "language": "kuery"}, "filter": []}
 
+def metric_vis_kql(dv_id, label, agg_type="count", field=None, kql=""):
+    """Metric panel with optional KQL filter and arbitrary aggregation type."""
+    params = {}
+    if field:
+        params["field"] = field
+    return {
+        "type": "metric",
+        "aggs": [{"id": "1", "enabled": True, "type": agg_type,
+                  "params": params, "schema": "metric"}],
+        "params": {
+            "metric": {
+                "percentageMode": False, "useRanges": False,
+                "colorSchema": "Green to Red", "metricColorMode": "None",
+                "colorsRange": [{"from": 0, "to": 10000}],
+                "labels": {"show": True}, "invertColors": False,
+                "style": {"bgFill": "#000", "bgColor": False, "labelColor": False,
+                          "subText": label, "fontSize": 60}
+            },
+            "dimensions": {}
+        }
+    }, {"index": dv_id, "query": {"query": kql, "language": "kuery"}, "filter": []}
+
+def filters_hbar_vis(dv_id, filter_list, kql=""):
+    """Horizontal bar with explicit filter buckets (label, kql) instead of a terms field."""
+    fparams = [{"input": {"query": q, "language": "kuery"}, "label": lbl}
+               for lbl, q in filter_list]
+    return {
+        "type": "horizontal_bar",
+        "aggs": [
+            {"id": "1", "enabled": True, "type": "count", "params": {}, "schema": "metric"},
+            {"id": "2", "enabled": True, "type": "filters", "schema": "segment",
+             "params": {"filters": fparams}}
+        ],
+        "params": {
+            "type": "histogram", "grid": {"categoryLines": False},
+            "categoryAxes": [{"id": "CategoryAxis-1", "type": "category",
+                              "position": "left", "show": True, "style": {},
+                              "scale": {"type": "linear"},
+                              "labels": {"show": True, "rotate": 0, "filter": False,
+                                         "truncate": 300},
+                              "title": {}}],
+            "valueAxes": [{"id": "ValueAxis-1", "name": "LeftAxis-1",
+                           "type": "value", "position": "bottom", "show": True,
+                           "style": {}, "scale": {"type": "linear", "mode": "normal"},
+                           "labels": {"show": True, "rotate": 0, "filter": True,
+                                      "truncate": 100},
+                           "title": {"text": "Requests"}}],
+            "seriesParams": [{"show": True, "type": "histogram", "mode": "stacked",
+                              "data": {"label": "Requests", "id": "1"},
+                              "valueAxis": "ValueAxis-1",
+                              "drawLinesBetweenPoints": True, "lineWidth": 2,
+                              "showCircles": True}],
+            "addTooltip": True, "addLegend": False, "legendPosition": "right",
+            "times": [], "addTimeMarker": False, "maxLegendLines": 1, "truncateLegend": True
+        }
+    }, {"index": dv_id, "query": {"query": kql, "language": "kuery"}, "filter": []}
+
+def table_vis_multi(dv_id, terms_field, size, metrics_spec, kql="", order_col="1"):
+    """
+    Table vis with arbitrary metric columns before a terms bucket.
+    metrics_spec: list of (agg_type, field_or_None) tuples.
+    """
+    aggs = []
+    for i, (agg_type, field) in enumerate(metrics_spec, 1):
+        params = {}
+        if field:
+            params["field"] = field
+        aggs.append({"id": str(i), "enabled": True, "type": agg_type,
+                     "params": params, "schema": "metric"})
+    aggs.append({
+        "id": str(len(metrics_spec) + 1), "enabled": True,
+        "type": "terms", "schema": "bucket",
+        "params": {"field": terms_field, "size": size, "order": "desc",
+                   "orderBy": order_col, "otherBucket": False}
+    })
+    return {
+        "type": "table",
+        "aggs": aggs,
+        "params": {
+            "perPage": size, "showPartialRows": False, "showMetricsAtAllLevels": False,
+            "showTotal": False, "totalFunc": "sum", "percentageCol": "", "row": False
+        }
+    }, {"index": dv_id, "query": {"query": kql, "language": "kuery"}, "filter": []}
+
+def markdown_vis(text):
+    return {
+        "type": "markdown",
+        "aggs": [],
+        "params": {"markdown": text, "openLinksInNewTab": True, "fontSize": 12}
+    }, {"index": "", "query": {"query": "", "language": "kuery"}, "filter": []}
+
+def area_vis_kql(dv_id, kql="", interval="auto"):
+    vs, ss = area_vis(dv_id, interval)
+    ss["query"] = {"query": kql, "language": "kuery"}
+    return vs, ss
+
+# ── Cache Analysis Dashboard ────────────────────────────────────────────────
+
+# Static asset KQL patterns (reused across panels)
+_IMG  = ("(url.path:*.jpg OR url.path:*.jpeg OR url.path:*.png OR url.path:*.gif "
+         "OR url.path:*.svg OR url.path:*.webp OR url.path:*.ico OR url.path:*.avif "
+         "OR url.path:/img/*)")
+_JS   = "url.path:*.js"
+_CSS  = "url.path:*.css"
+_FONT = "(url.path:*.woff OR url.path:*.woff2 OR url.path:*.ttf)"
+_ALL_STATIC = f"({_IMG} OR {_JS} OR {_CSS} OR {_FONT})"
+
+def build_cache_dashboard(base, pw, dv_id="elk-waas-access"):
+    A = dv_id
+    S304 = f"{_ALL_STATIC} AND http.response.status_code:304"
+
+    print("\n=== Building Cache Analysis visualizations ===")
+
+    # ── Row 1: KPI summary ──────────────────────────────────────────────────
+    vs, ss = metric_vis_kql(A, "Total Static Asset Requests", kql=_ALL_STATIC)
+    upsert_viz(base, pw, "waas-cache-total-static", "Static Requests", vs, ss)
+
+    vs, ss = metric_vis_kql(A, "Unique Visitor IPs (cardinality)",
+                            "cardinality", "source.ip", _ALL_STATIC)
+    upsert_viz(base, pw, "waas-cache-unique-ips", "Unique Visitor IPs", vs, ss)
+
+    vs, ss = metric_vis_kql(A, "Requests Already Browser-Cached (304)", kql=S304)
+    upsert_viz(base, pw, "waas-cache-304s", "Existing 304s", vs, ss)
+
+    # ── Row 2: Content type bar + markdown explainer ────────────────────────
+    vs, ss = filters_hbar_vis(A, [
+        ("Images  (.jpg .png .gif .svg .ico .webp /img/*)", _IMG),
+        ("JavaScript  (.js)",                               _JS),
+        ("CSS  (.css)",                                     _CSS),
+        ("Fonts  (.woff .woff2 .ttf)",                      _FONT),
+    ])
+    upsert_viz(base, pw, "waas-cache-by-type",
+               "Static Requests by Content Type", vs, ss)
+
+    explainer_md = """\
+### How to estimate Cache-Control savings
+
+The **Top Static Assets** table below shows three metrics per URL path:
+
+| Column | Meaning |
+|--------|---------|
+| **Count** | Total requests for this asset |
+| **Unique IPs** | Distinct client IPs that fetched it |
+| **Avg Bytes** | Average response size |
+
+With `Cache-Control: max-age=7200`, a browser only fetches each
+asset **once per 2-hour window**. Subsequent requests come from the
+local cache — zero origin requests, zero bandwidth.
+
+**Estimated cacheable requests per asset:**
+> `Count − Unique IPs ≈ repeat requests that would be eliminated`
+
+**Estimated bandwidth saved per asset:**
+> `(Count − Unique IPs) × Avg Bytes`
+
+For a precise site-wide summary broken down by content type, run:
+
+```
+python3 tests/verify/cache_impact_report.py \\
+  https://ES_HOST:9200 PASSWORD Lightology --ttl 7200
+```
+
+**Recommended header (apply to all static paths):**
+```
+Cache-Control: public, max-age=7200, immutable
+```
+`immutable` eliminates conditional revalidation on browser reload,
+removing the 304 round-trips visible in the timeline below.
+"""
+    vs, ss = markdown_vis(explainer_md)
+    upsert_viz(base, pw, "waas-cache-explainer",
+               "How to Read This Dashboard", vs, ss)
+
+    # ── Row 3: Per-type request counts ──────────────────────────────────────
+    for vid, label, kql in [
+        ("waas-cache-img-count",  "Image Requests",      _IMG),
+        ("waas-cache-js-count",   "JavaScript Requests", _JS),
+        ("waas-cache-css-count",  "CSS Requests",        _CSS),
+        ("waas-cache-font-count", "Font Requests",       _FONT),
+    ]:
+        vs, ss = metric_vis_kql(A, label, kql=kql)
+        upsert_viz(base, pw, vid, label, vs, ss)
+
+    # ── Row 4: Per-asset table — Count | Unique IPs | Avg Bytes ────────────
+    vs, ss = table_vis_multi(
+        A, "url.path", 30,
+        [
+            ("count",       None),                       # col 1: total requests
+            ("cardinality", "source.ip"),                # col 2: unique client IPs
+            ("avg",         "http.response.body.bytes"), # col 3: avg response size
+        ],
+        kql=_ALL_STATIC,
+        order_col="1",
+    )
+    upsert_viz(base, pw, "waas-cache-top-assets",
+               "Top Static Assets — Count | Unique IPs | Avg Bytes  "
+               "(Cacheable ≈ Count − Unique IPs)", vs, ss)
+
+    # ── Row 5: Timelines ─────────────────────────────────────────────────────
+    vs, ss = area_vis_kql(A, kql=_ALL_STATIC)
+    upsert_viz(base, pw, "waas-cache-static-timeline",
+               "Static Asset Requests Over Time", vs, ss)
+
+    vs, ss = area_vis_kql(A, kql=S304)
+    upsert_viz(base, pw, "waas-cache-304-timeline",
+               "Browser Cache Hits (304) Over Time", vs, ss)
+
+    # ── Dashboard layout ─────────────────────────────────────────────────────
+    print("\n=== Building Cache Analysis dashboard ===")
+    cache_panels = [
+        # Row 1 (y=0, h=8): 3 KPI metrics — total, unique IPs, existing 304s
+        {"id": "waas-cache-total-static", "grid": {"x": 0,  "y": 0,  "w": 8,  "h": 8}},
+        {"id": "waas-cache-unique-ips",   "grid": {"x": 8,  "y": 0,  "w": 8,  "h": 8}},
+        {"id": "waas-cache-304s",         "grid": {"x": 16, "y": 0,  "w": 8,  "h": 8}},
+        # Row 2 (y=8, h=13): content type bar + how-to explainer
+        {"id": "waas-cache-by-type",      "grid": {"x": 0,  "y": 8,  "w": 11, "h": 13}},
+        {"id": "waas-cache-explainer",    "grid": {"x": 11, "y": 8,  "w": 13, "h": 13}},
+        # Row 3 (y=21, h=7): 4 content-type counters
+        {"id": "waas-cache-img-count",    "grid": {"x": 0,  "y": 21, "w": 6,  "h": 7}},
+        {"id": "waas-cache-js-count",     "grid": {"x": 6,  "y": 21, "w": 6,  "h": 7}},
+        {"id": "waas-cache-css-count",    "grid": {"x": 12, "y": 21, "w": 6,  "h": 7}},
+        {"id": "waas-cache-font-count",   "grid": {"x": 18, "y": 21, "w": 6,  "h": 7}},
+        # Row 4 (y=28, h=16): per-asset table
+        {"id": "waas-cache-top-assets",   "grid": {"x": 0,  "y": 28, "w": 24, "h": 16}},
+        # Row 5 (y=44, h=10): timelines
+        {"id": "waas-cache-static-timeline", "grid": {"x": 0,  "y": 44, "w": 12, "h": 10}},
+        {"id": "waas-cache-304-timeline",    "grid": {"x": 12, "y": 44, "w": 12, "h": 10}},
+    ]
+    upsert_dashboard(base, pw, "waas-cache-analysis",
+                     "Static Asset Cache Analysis", cache_panels)
+
 # ── Main ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -398,10 +630,13 @@ def main():
     upsert_dashboard(base, pw, "waas-traffic-overview",
                      "Application Traffic", tr_panels)
 
+    build_cache_dashboard(base, pw, dv_id="elk-waas-access")
+
     print("\n=== Done ===")
     print("Dashboards created:")
-    print(f"  Security: {base}/app/dashboards#/view/waas-security-overview")
-    print(f"  Traffic:  {base}/app/dashboards#/view/waas-traffic-overview")
+    print(f"  Security:       {base}/app/dashboards#/view/waas-security-overview")
+    print(f"  Traffic:        {base}/app/dashboards#/view/waas-traffic-overview")
+    print(f"  Cache Analysis: {base}/app/dashboards#/view/waas-cache-analysis")
 
 if __name__ == "__main__":
     main()
