@@ -454,6 +454,35 @@ removing the 304 round-trips visible in the timeline below.
     upsert_dashboard(base, pw, "waas-cache-analysis",
                      "Static Asset Cache Analysis", cache_panels)
 
+# ── App Volume Dashboard ─────────────────────────────────────────────────────
+
+def build_app_volume_dashboard(base, pw):
+    print("\n=== Building App Volume visualizations ===")
+    DV_A = "elk-waas-access"
+    DV_F = "elk-waas-firewall"
+
+    vs, ss = metric_vis_kql(DV_A, "Total Access Log Events")
+    upsert_viz(base, pw, "waas-vol-access-total", "Total Access Events", vs, ss)
+
+    vs, ss = metric_vis_kql(DV_F, "Total Firewall Log Events")
+    upsert_viz(base, pw, "waas-vol-firewall-total", "Total Firewall Events", vs, ss)
+
+    vs, ss = hbar_vis(DV_A, "waas.unit_name", size=25)
+    upsert_viz(base, pw, "waas-vol-access-by-app",
+               "Access Log Events by Application", vs, ss)
+
+    vs, ss = hbar_vis(DV_F, "waas.unit_name", size=25)
+    upsert_viz(base, pw, "waas-vol-firewall-by-app",
+               "Firewall Log Events by Application", vs, ss)
+
+    print("\n=== Building App Volume dashboard ===")
+    upsert_dashboard(base, pw, "waas-app-volume", "Application Traffic Volume", [
+        {"id": "waas-vol-access-total",    "grid": {"x": 0,  "y": 0,  "w": 12, "h": 7}},
+        {"id": "waas-vol-firewall-total",  "grid": {"x": 12, "y": 0,  "w": 12, "h": 7}},
+        {"id": "waas-vol-access-by-app",   "grid": {"x": 0,  "y": 7,  "w": 12, "h": 20}},
+        {"id": "waas-vol-firewall-by-app", "grid": {"x": 12, "y": 7,  "w": 12, "h": 20}},
+    ])
+
 # ── Main ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -631,12 +660,14 @@ def main():
                      "Application Traffic", tr_panels)
 
     build_cache_dashboard(base, pw, dv_id="elk-waas-access")
+    build_app_volume_dashboard(base, pw)
 
     print("\n=== Done ===")
     print("Dashboards created:")
     print(f"  Security:       {base}/app/dashboards#/view/waas-security-overview")
     print(f"  Traffic:        {base}/app/dashboards#/view/waas-traffic-overview")
     print(f"  Cache Analysis: {base}/app/dashboards#/view/waas-cache-analysis")
+    print(f"  App Volume:     {base}/app/dashboards#/view/waas-app-volume")
 
 if __name__ == "__main__":
     main()
