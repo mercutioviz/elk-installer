@@ -1,5 +1,5 @@
 name: barracuda-waas
-version: 0.1.0
+version: 0.2.2
 description: |
   Barracuda WAF-as-a-Service (WaaS) syslog ingest.
   Parses both TR (Traffic/Access) and WF (Web Firewall) record types
@@ -49,6 +49,10 @@ fields:
     type: keyword
   - name: "network.transport"
     type: keyword
+  - name: "network.application"
+    type: keyword
+  - name: "tls.version"
+    type: keyword
   - name: "source.geo.country_iso_code"
     type: keyword
   # TR specific
@@ -81,6 +85,25 @@ fields:
     type: text
 
 changelog:
+  - version: 0.2.2
+    date: 2026-06-18
+    notes: |
+      Fix network.transport semantic mismatch: WaaS %p outputs TLSv1.x/HTTP/HTTPS,
+      not an L4 transport. Now mapped to tls.version (e.g. "1.3"), network.transport
+      ("tcp"), and network.application ("http"/"https"). Add null-sentinel gsub for
+      waas.custom_header_1/2/3. Normalize WaaS 4-char severity abbreviations
+      (ALER, CRIT, etc.) to full names (ALERT, CRITICAL, etc.) via translate filter.
+  - version: 0.2.1
+    date: 2026-05-31
+    notes: |
+      Remove #012 (embedded newline) cleanup mutate — no longer needed after
+      switching to RSYSLOG_FileFormat forwarding template.
+  - version: 0.2.0
+    date: 2026-05-31
+    notes: |
+      Rewrite to kv-filter pipeline. Single-pass KEY=VALUE parsing replaces
+      multi-grok positional approach. UA extracted separately (quoted multi-word).
+      ADL captured with GREEDYDATA. ECS field renames and type conversions.
   - version: 0.1.0
     date: 2026-05-31
     notes: |
