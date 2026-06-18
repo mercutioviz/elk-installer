@@ -239,7 +239,7 @@ def metric_vis_kql(dv_id, label, agg_type="count", field=None, kql=""):
                 "colorsRange": [{"from": 0, "to": 10000}],
                 "labels": {"show": True}, "invertColors": False,
                 "style": {"bgFill": "#000", "bgColor": False, "labelColor": False,
-                          "subText": label, "fontSize": 60}
+                          "subText": label, "fontSize": 32}
             },
             "dimensions": {}
         }
